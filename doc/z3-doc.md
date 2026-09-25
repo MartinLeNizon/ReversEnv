@@ -1,786 +1,1159 @@
-# LIEF Python documentation for AI-assisted binary analysis
+# Z3 documentation for AI-assisted analysis
 
 ## Summary — read this first
 
-**Subject: LIEF, not Z3.** This reference intentionally lives at `doc/z3-doc.md`
-as requested. The Python distribution and import are both **`lief`**. LIEF parses,
-inspects, edits, and rebuilds executable file formats. It is not a symbolic
-executor, constraint solver, operating-system loader, or proof of program behavior.
+**Z3** is an SMT (satisfiability modulo theories) solver. The Python distribution
+is **`z3-solver`**, imported as **`z3`**; its Python interface is called **Z3Py**.
+Use it to construct typed symbolic expressions, assert constraints, ask whether
+those constraints can hold together, and extract a witness or prove that no
+witness exists. Z3 does not load binaries, execute instructions, or infer the
+semantics of a Python function. You must encode those semantics or use a frontend
+such as angr. See also [the angr reference](angr-doc.md#s06).
 
-**Version:** ReversEnv pins `lief==1.0.0`. This guide was checked against installed
-LIEF **1.0.0-d05b3499b**, CPython **3.12.14**, Linux x86-64, on **2026-09-25**.
-The installed package is the standard build (`lief.__extended__ == False`).
-The normal workflow is **identify input → parse → inspect format and addresses →
-make a bounded edit → write to a new path → reparse → verify the intended change →
-test behavior in the target environment when required**.
+This reference targets ReversEnv's **`z3-solver==5.1.0.0`** dependency. Examples
+were tested with **CPython 3.12.14, Z3 5.1.0, Linux x86-64** in a clean environment.
+See [validation and reproduction](#s22) for the exact scope and reproduction steps.
+Use the task table to retrieve a small section; do not load the whole reference
+when a single API contract or recipe answers the question.
 
-Essential rules:
+**Normal workflow:** choose sorts → declare inputs → encode operations and input
+domain → `Solver().add(...)` → `check()` → handle `sat` / `unsat` / `unknown` →
+evaluate all related outputs in one model → replay or independently verify.
 
-1. Check parse results for `None` and the expected concrete format. A partially
-   parsed malformed file is not necessarily usable just because parsing returned.
-2. Distinguish file offsets, relative virtual addresses (RVAs), link-time virtual
-   addresses (VAs), and runtime addresses. Sizes and offsets here are **bytes**.
-3. Use explicit `lief.Binary.VA_TYPES.RVA` or `.VA` for PE reads and patches;
-   `AUTO` is the default and can hide an address-domain mistake.
-4. Copy native views with `bytes(...)` when retaining content. Keep parent binary
-   objects alive; reacquire sections and symbols after structural mutations.
-5. Validate the whole patch range is file-backed. Zero-filled memory such as BSS
-   does not automatically have bytes in the file that can be patched.
-6. Editing changes the in-memory model. `write()` rebuilds it and can move data.
-   Recompute addresses and offsets from the output, not from the old model.
-7. PE import/export edits require corresponding builder options; in 1.0.0,
-   `config.imports` and `config.exports` default to `False`.
-8. Use `lief.MachO.parse()` for universal binaries: it returns a `FatBinary`,
-   including for a thin input. Select an architecture deliberately.
-9. Empty tables can mean stripped data, disabled parsing, or incomplete recovery.
-   They are not proof that a program has no imports, symbols, or relevant behavior.
-10. Reparse success checks structure, not runtime correctness. Editing signed
-    content can invalidate signatures; copying signature bytes does not re-sign it.
+**Essential rules:**
+
+1. `Int` and `Real` are mathematical values. Use `BitVec(name, bits)` for
+   fixed-width machine arithmetic and `FP` for IEEE floating point.
+2. Z3 bitvectors have no stored signedness. `<`, `<=`, `>`, `>=`, `/`, `%`, and
+   `>>` select signed operations; use explicit unsigned operators as needed.
+   **Claripy comparisons default to unsigned; Z3Py comparisons do not.**
+3. Symbolic expressions are not Python values. Build `And`, `Or`, `Not`, and
+   `If`; do not use Python `and`, `or`, `not`, chained comparisons, or `if expr`.
+4. Declare one symbol per logical input and reuse it. Same name + sort + context
+   denotes the same Z3 constant; declarations are not automatically fresh.
+5. `sat` means a witness exists for the encoded formula. `unsat` means none
+   exists for that formula. `unknown`, timeouts, and bounded search exhaustion
+   are not proofs of impossibility in the actual program.
+6. Call `model()` only after a successful `sat` check for the current query.
+   A model is one assignment, not a uniqueness guarantee. Model completion fills
+   missing values arbitrarily; it does not discover additional facts.
+7. Prove `P` under assumptions `A` by checking `A ∧ Not(P)` for `unsat`.
+   Check that `A` is itself satisfiable to detect a vacuous proof.
+8. State widths, signedness, overflow, endianness, valid memory, division guards,
+   environment assumptions, and solver budgets. Z3 does not supply CPU traps,
+   language undefined behavior, or memory safety automatically.
+9. Enumerate correlated inputs from one model and block the whole tuple.
+   Enumerate only a finite projection or impose a limit and report incompleteness.
+10. Record package version, assertions, parameters, result, and replay outcome.
+    Diagnose a wrong encoding before tuning the solver.
 
 ## Task index — retrieve only what you need
 
-| Question / API | Section |
-| --- | --- |
-| Install, check version, inspect an unfamiliar method | [S01 Installation](#s01) |
-| First working parse; `lief.parse`, `bytes(section.content)` | [S02 Quick start](#s02) |
-| Choose parser; `ParserConfig`; `None`, errors, ownership | [S03 Parsing and object model](#s03) |
-| VA vs RVA vs file offset; ASLR; BSS; integer encoding | [S04 Addresses and bytes](#s04) |
-| Sections, segments, symbols, imports, relocations | [S05 Inspection](#s05) |
-| `patch_address`, `write`, builder configuration, verification | [S06 Editing contract](#s06) |
-| ELF symbols, dependencies, RUNPATH, section insertion | [S07 ELF](#s07) |
-| PE imports, exports, resources, Authenticode | [S08 PE](#s08) |
-| Mach-O slices, load commands, dylibs, signing | [S09 Mach-O](#s09) |
-| Complete ELF patch with native replay | [S10 ELF lab](#s10) |
-| Complete PE rebuild with imports and a section | [S11 PE lab](#s11) |
-| Complete Mach-O object inspection | [S12 Mach-O lab](#s12) |
-| Debug parser failures or a broken rebuilt file | [S13 Troubleshooting](#s13) |
-| Large inputs, specialized formats, angr integration, limits | [S14 Advanced boundaries](#s14) |
-| Reproduce checks; tested / untested scope; primary references | [S15 Validation and sources](#s15) |
+| Task or question | Start here | Related section |
+| --- | --- | --- |
+| Install, check version, fix `import z3` | [S01 Installation](#s01) | [S21 Troubleshooting](#s21) |
+| Solve a first constraint | [S02 Quick start](#s02) | [S07 Solver API](#s07) |
+| Choose a type; understand ASTs and symbols | [S03 Object model](#s03) | [S04 Boolean expressions](#s04) |
+| Integers, rationals, division | [S05 Arithmetic](#s05) | [S19 Performance](#s19) |
+| Registers, overflow, shifts, casts | [S06 Bitvectors](#s06) | [S17 Reverse-engineering example](#s17) |
+| Understand `sat`, `unsat`, `unknown`, timeout | [S07 Solver API](#s07) | [S21 Troubleshooting](#s21) |
+| Evaluate a model; extract bytes; prove uniqueness | [S08 Models](#s08) | [S17 Reverse-engineering example](#s17) |
+| Branch temporarily, explain a contradiction | [S09 Scopes and cores](#s09) | [S07 Solver API](#s07) |
+| Prove an identity or enumerate inputs | [S10 Proof and enumeration](#s10) | [S18 Bounded execution](#s18) |
+| Memory, byte order, symbolic addresses | [S11 Arrays and memory](#s11) | [S06 Bitvectors](#s06) |
+| Unknown functions, enums, records, lists | [S12 Functions and datatypes](#s12) | [S13 Quantifiers](#s13) |
+| `ForAll`, `Exists`, triggers, F* proof queries | [S13 Quantifiers](#s13) | [S19 Internals](#s19) |
+| Text, sequences, regex; IEEE floats | [S14 Strings and floating point](#s14) | [S03 Sorts](#s03) |
+| Minimize, maximize, soft constraints | [S15 Optimization](#s15) | [S07 Check results](#s07) |
+| Simplify, inspect ASTs, tactics, SMT-LIB | [S16 Inspection and interchange](#s16) | [S20 Contexts](#s20) |
+| Threads, contexts, proof objects, Horn clauses | [S20 Specialist APIs](#s20) | [S19 Internals](#s19) |
+| Reproduce tests, find sources and coverage limits | [S22 Validation](#s22) | [S23 Sources and glossary](#s23) |
 
-Every section has a stable explicit anchor. Code labeled **Runnable example** is
-complete with its stated external requirements. **Fragment/recipe** needs the
-specified input or surrounding objects. **Doctest** is executable interactive
-Python. Printed symbol names, table order, addresses, and binary hashes are not
-portable expected output unless explicitly asserted for a constructed fixture.
+### Readiness labels and result record
+
+- **Runnable example:** a complete `python` fence; run independently with
+  `z3-solver` installed. Assertions check behavior; silent completion is success.
+- **Fragment/recipe:** requires the named surrounding objects or real target;
+  it is guidance rather than a standalone tested script.
+- **Console recipe:** installation or diagnostic commands; paths may need adapting.
+
+Before analysis, record input domains, target semantics, success predicate,
+assumptions, and bounds. After analysis, record the three-way solver result,
+`reason_unknown()` if applicable, witness or contradiction, and replay outcome.
+Native replay is required before claiming a generated input works on a real
+binary. The examples here use small independent Python checks, not a supplied
+native executable.
 
 <a id="s01"></a>
-## [S01] Installation and version discipline
 
-Use ReversEnv's environment from the project root. The shell below is a
-**Fragment/recipe** for an existing checkout; it does not create an environment:
+## [S01] Installation and version checks
 
-```sh
-.venv/bin/python -c 'import sys, lief; print(sys.version); print(lief.__version__); print(lief.__extended__)'
+Use the distribution named `z3-solver`, not an unrelated package named `z3`.
+For documentation experiments, an isolated environment avoids changing angr's
+solver dependency. ReversEnv's pin is in `requirements.txt`; do not upgrade only
+its solver package without checking the rest of the analysis stack.
+
+**Console recipe** (run from ReversEnv; use a new environment path):
+
+```console
+python3.12 -m venv /tmp/reversenv-z3-guide
+/tmp/reversenv-z3-guide/bin/python -m pip install z3-solver==5.1.0.0
+/tmp/reversenv-z3-guide/bin/python -c "import z3; from importlib.metadata import version; print(version('z3-solver')); print(z3.get_version_string()); print(z3.__file__)"
 ```
 
-For an independent environment, this **Fragment/recipe** requires Python's `venv`
-and package-index access:
+Expected versions for this edition: distribution `5.1.0.0`, library `5.1.0`.
+`get_version()` returns a tuple; `get_full_version()` gives a build/version string.
+Use the same interpreter for installing and running. Avoid a local `z3.py` or
+`z3/` directory that shadows the package. If metadata exists but `z3.Solver` does
+not, inspect `z3.__file__` and verify a clean installation before trusting it.
 
-```sh
-python3 -m venv /tmp/lief-reference-env
-/tmp/lief-reference-env/bin/python -m pip install 'lief==1.0.0'
-```
-
-Do not upgrade the project or replace its pins to run an example. Native wheel
-availability depends on interpreter, OS, and architecture; a source build has
-additional compiler/build requirements. No installation was necessary for this
-reference. See [official installation guidance](https://lief.re/doc/stable/installation.html).
-
-Check `help(lief.PE.Binary.write)` or a method's `.__doc__` against the installed
-release before adapting old code. Current enums are nested, for example
-`lief.ELF.Section.TYPE.PROGBITS` and `lief.ELF.Segment.TYPE.LOAD`. Old tutorials can
-use removed top-level enums or obsolete PE builders. Never infer a Python call
-signature from a C++ overload alone.
-
-**Doctest — byte encoding and installed API defaults (1.0.0):**
-
-```pycon
->>> import lief
->>> lief.__version__.split('-')[0]
-'1.0.0'
->>> lief.PE.Builder.config_t().imports
-False
->>> lief.PE.Builder.config_t().exports
-False
->>> list((0x1234).to_bytes(2, 'little', signed=False))
-[52, 18]
->>> int.from_bytes(b'\xff\xff', 'little', signed=True)
--1
-```
+Source: [official Z3 repository and installation instructions](https://github.com/Z3Prover/z3).
 
 <a id="s02"></a>
-## [S02] Minimal working parse
 
-**Runnable example — Linux only; uses the running Python executable as input.**
-No external binary or compiler is required. This reads, but never edits, Python.
+## [S02] Quick start: solve and verify a byte
+
+**Runnable example:** recover an eight-bit input whose wrapped addition is 42.
 
 ```python
-import sys
-from pathlib import Path
-import lief
+import z3
 
-path = Path(sys.executable).resolve()
-binary = lief.parse(path)
-assert isinstance(binary, lief.ELF.Binary), 'This example requires an ELF Python'
-section = binary.get_section('.text')
-assert section is not None and section.size > 0
-content = bytes(section.content)
-assert len(content) == section.size
-assert 0 <= section.offset <= path.stat().st_size - len(content)
-assert path.read_bytes()[section.offset:section.offset + len(content)] == content
-again = lief.parse(path.read_bytes())
-assert isinstance(again, lief.ELF.Binary)
-assert again.entrypoint == binary.entrypoint
-print(type(binary).__name__, hex(binary.entrypoint), len(content))
+x = z3.BitVec("input_byte", 8)
+s = z3.Solver()
+s.set(timeout=5000)  # milliseconds per solver check
+s.add(z3.UGE(x, 0x20), z3.ULE(x, 0x7e), x + 1 == 42)
+result = s.check()
+if result == z3.sat:
+    value = s.model().eval(x).as_long()
+    assert value == 41
+    assert (value + 1) & 0xff == 42
+elif result == z3.unsat:
+    raise AssertionError("No byte meets the encoded constraints")
+else:
+    raise RuntimeError(s.reason_unknown())
 ```
 
-`get_section(name)` can return `None`, including for stripped or unusual inputs.
-The `.text` assumption belongs to this fixture, not every ELF. A content view is
-not a snapshot until copied. See [S03](#s03) for ownership and [S04](#s04) before
-using addresses from another analysis tool.
+`x + 1 == 42` builds a formula; `add` asserts it; `check` performs search.
+`as_long()` converts a concrete numeral, not an arbitrary symbolic expression.
+The asserted result is deterministic here because the constraints fix `x`.
 
 <a id="s03"></a>
-## [S03] Parsing, object model, and failures
 
-The following contracts were inspected in the installed Python bindings.
+## [S03] Object model, sorts, and symbol identity
 
-| Call | Return and important behavior |
+| Object/API | Meaning and principal contract |
 | --- | --- |
-| `lief.parse(obj)` | Concrete supported format object or `None`; dispatches by input. No parser configuration argument. |
-| `lief.ELF.parse(obj, config=...)` | `lief.ELF.Binary` or `None`. |
-| `lief.PE.parse(obj, config=...)` | `lief.PE.Binary` or `None`. |
-| `lief.MachO.parse(obj, config=...)` | `lief.MachO.FatBinary` or `None`, even for one architecture. |
+| `Context()` | Owns Z3 objects; expressions from different contexts cannot be mixed directly. Default constructors use a shared main context. |
+| `BoolSort()`, `IntSort()`, `BitVecSort(n)` | Sort descriptors; bitvector `n` is a positive width in bits. |
+| `Const(name, sort)` | Creates a symbolic constant of that sort, not an initialized mutable cell. |
+| `Bool(name)`, `Int(name)`, `Real(name)`, `BitVec(name, n)` | Convenience constant constructors; optional `ctx` selects a context. |
+| `BoolVal(v)`, `IntVal(v)`, `RealVal(v)`, `BitVecVal(v, n)` | Concrete symbolic literals. Use strings for exact decimal/rational input. Bitvector numerals reduce modulo `2**n`. |
+| `ExprRef`, `BoolRef`, `ArithRef`, `BitVecRef` | Python wrappers around immutable expression ASTs. Operators construct further ASTs. |
+| `Solver()` / `ModelRef` | Mutable assertion/search state / interpretation returned after a satisfiable query. |
+| `FreshConst(sort, prefix="c")` | Creates a new symbol even when the prefix is reused. |
 
-`obj` accepts a path (`str` or `os.PathLike`), raw `bytes`, `list[int]`, or supported
-`io.IOBase` input. Bytes mean file content, not an encoded filename. For explicit,
-repeatable stream behavior, read the desired data and pass `bytes`. Raw input must
-be a supported file image; a memory dump is not automatically the same layout.
+Choose `Bool` for conditions; `Int` for counts without wraparound; `Real` for
+exact mathematics; `BitVec` for words/bytes; `Array` for indexed maps; `String`
+for text; `FP` for IEEE values; a datatype for a structured value. Z3 sort
+checking is not the source language's type checker.
 
-The generic parser in this build also lists OAT and COFF returns. Its Mach-O return
-is a single `MachO.Binary`; use the format parser when preserving slices matters.
-Other specialized formats have their own APIs; do not assume all inherit the same
-editing capabilities.
+Within one context, two `Int("x")` calls denote the same constant. A Python
+assignment such as `x = x + 1` rebinds the Python name; it does not mutate the
+previous AST or assert a state transition. Use `x0`, `x1`, and `x1 == x0 + 1`
+when separate states are needed. Do not use the same textual name across sorts
+in generated scripts; even when representable, it complicates interchange.
 
-**Fragment/recipe — configurable ELF parse; replace the input path:**
+**Runnable example:** distinguish AST identity from logical equivalence.
 
 ```python
-import lief
-config = lief.ELF.ParserConfig()
-config.parse_relocations = True
-config.parse_dyn_symbols = True
-binary = lief.ELF.parse('input.elf', config)
-if binary is None:
-    raise ValueError('ELF parser did not return a binary')
+import z3
+
+x = z3.Int("x")
+assert z3.eq(x, z3.Int("x"))
+assert not z3.eq(x + 0, x)  # structural comparison, not a theorem check
+assert z3.eq(z3.simplify(x + 0), x)
+assert (x + 1).sort() == z3.IntSort()
 ```
 
-Observed defaults in 1.0.0:
-
-| Config | Relevant defaults |
-| --- | --- |
-| `ELF.ParserConfig()` | Dynamic and symtab symbols, relocations, notes, overlay, symbol versions enabled; `page_size=0` leaves size selection to the parser. |
-| `PE.ParserConfig()` | Imports, exports, relocations, resources, signatures enabled; exceptions and alternative ARM64X binary parsing disabled. |
-| `MachO.ParserConfig()` | Dyld bindings, exports, rebases enabled. `quick` and `deep` presets also exist; choose deliberately. |
-
-Disabling work can improve inspection performance but produces an intentionally
-incomplete model. Do not rewrite from a reduced model without verifying that the
-skipped structures survive correctly. Create a fresh config rather than mutating
-a shared preset object in place.
-
-Failure reporting is API-specific: parsers may return `None` and emit diagnostics;
-lookups return `None`; some methods return `lief.lief_errors`; type conversion or
-I/O can raise exceptions. There is no universal “all failures raise” rule.
-Capture diagnostics and distinguish unsupported input from a valid empty table.
-For untrusted or very large files, parse in a resource-limited subprocess; Python
-exception handling does not contain a native crash or excessive memory use.
-
-Binary objects own native structures. Iterators and child objects should not be
-used after the parent is discarded or a structural edit invalidates them. Do not
-remove items while traversing a native iterator. Snapshot names/addresses first,
-then perform mutations and reacquire the native objects.
-
-References: [binary abstraction](https://lief.re/doc/stable/api/binary_abstraction/python.html),
-[ELF parser](https://lief.re/doc/stable/formats/elf/python.html),
-[PE parser](https://lief.re/doc/stable/formats/pe/python.html),
-[Mach-O parser](https://lief.re/doc/stable/formats/macho/python.html).
+`eq(a, b)` returns a Python Boolean for structural equality. `a == b` normally
+builds a symbolic equality. `is_true(e)` recognizes the literal true AST; it
+does not ask whether current solver assertions imply `e`.
 
 <a id="s04"></a>
-## [S04] Address domains, widths, and file-backed bytes
 
-Python integers are concrete, arbitrary-precision values. LIEF converts them to
-bounded native fields; negative or oversized values can fail conversion. There
-are no symbolic expressions or solver constraints here. Validate ranges yourself.
-Read machine type, bitness, and byte order from the target, not the host Python.
+## [S04] Boolean formulas and Python boundaries
 
-| Domain | Meaning and correct conversion |
-| --- | --- |
-| File offset | Byte index in the on-disk image. Not an argument to `patch_address`. |
-| ELF linked VA | Address described by ELF load segments. For a file-backed `PT_LOAD`: `offset = segment.file_offset + (va - segment.virtual_address)`. |
-| PE RVA | Address relative to the image base; section `virtual_address` is an RVA. Use `rva_to_offset(rva)`. |
-| PE preferred VA | `optional_header.imagebase + rva`; use `va_to_offset(va)`. |
-| Mach-O VA | Segment VM address domain; translate with `virtual_address_to_offset(va)`. |
-| Runtime address | Includes loader relocation / ASLR. Subtract the known load bias or slide before converting to the original file's VA domain. |
+| Intent | Z3Py expression | Contract / mistake to avoid |
+| --- | --- | --- |
+| All / any constraints | `And(*terms)` / `Or(*terms)` | Boolean terms; zero arguments mean true / false respectively. |
+| Negate / imply | `Not(p)` / `Implies(p, q)` | Python `not p` attempts a host Boolean conversion. |
+| Exclusive or / equivalence | `Xor(p, q)` / `p == q` | Boolean equality is equivalence. |
+| Symbolic conditional | `If(p, a, b)` | Branches must have compatible sorts; both AST branches are constructed. |
+| Interval | `And(x >= lo, x <= hi)` | `lo <= x <= hi` is a Python chained comparison and is wrong here. |
+| All pairwise unequal | `Distinct(*xs)` | A Boolean constraint, not an instruction that generates unique variables. |
+| At most / at least k true | `AtMost(*ps, k)` / `AtLeast(*ps, k)` | `ps` are Boolean expressions and `k` a concrete integer. |
+| Weighted Boolean sum | `PbEq([(p, 2), (q, 1)], 2)` | Integer coefficients; `PbLe` and `PbGe` express bounds. |
 
-For PE runtime addresses, first compute `rva = runtime_va - actual_loaded_base`.
-For ELF PIE, `runtime_va = linked_va + load_bias`; do not blindly subtract the first
-mapping address, which can include a nonzero file offset. For Mach-O fat files,
-distinguish offsets within a slice from positions in the enclosing universal file.
+Parenthesize each comparison when composing formulas. Never rely on symbolic
+truth conversion: some equalities can convert using structural checks, producing
+silent Python control-flow mistakes instead of an exception.
 
-`ELF.Binary.virtual_address_to_offset(va)` and the Mach-O counterpart return
-`int | lief.lief_errors`. Check for `lief.lief_errors` before treating the result
-as an offset. `PE.Binary.rva_to_offset(rva)` returns an integer; a numerical result
-alone does not establish that the full range is valid or backed by file data.
-Validate the section/header region and file length separately.
+**Runnable example:** a symbolic absolute value and a branch-feasibility check.
 
-A range `[va, va+n)` must fit the file-backed part of the containing mapping.
-ELF uses `segment.physical_size` for file bytes and `virtual_size` for memory size.
-An ELF `NOBITS` section, PE virtual tail, or Mach-O zero-fill section can exist in
-memory without corresponding file bytes. Reading a shorter result is not success.
-Reject ambiguous overlapping mappings unless you deliberately model loader rules.
+```python
+import z3
 
-| Operation | Contract |
-| --- | --- |
-| `binary.get_content_from_virtual_address(address, size, va_type=VA_TYPES.AUTO)` | Returns a `memoryview`; `size` is bytes. Copy with `bytes(...)`, then check length. Explicit VA/RVA selection is particularly important for PE. |
-| `section.content` | Native byte view on read; use a sequence of byte integers for assignment. `bytes(section.content)` creates an independent snapshot. |
-| `value.to_bytes(width, byteorder, signed=False)` | Python encoding; width is bytes, byte order is `'little'` or `'big'`. Raises on out-of-range values. |
-| `int.from_bytes(data, byteorder, signed=False)` | Python decoding; signedness is your explicit interpretation. |
+x = z3.Int("x")
+absolute = z3.If(x >= 0, x, -x)
+s = z3.Solver()
+s.add(absolute == 7)
+assert s.check(x < 0) == z3.sat  # temporary assumption
+assert s.model().eval(x).as_long() == -7
+assert s.check(x > 0) == z3.sat  # previous assumption is gone
+assert s.model().eval(x).as_long() == 7
+```
 
-Prefer explicitly encoded byte sequences for integer patches, so endian and width
-choices are reviewable. ELF symbol values in relocatable `.o` files can be
-section-relative; undefined symbols, TLS symbols, and absolute symbols require
-special handling. Do not treat every `symbol.value` as an executable VA.
+A Python loop over a known `range(n)` is fine: it builds finitely many formulas.
+A Python loop controlled by a symbolic condition is not symbolic execution.
 
 <a id="s05"></a>
-## [S05] Inspect sections, symbols, imports, and relocations
 
-Inspect the concrete type first. Generic `sections`, `symbols`, `entrypoint`,
-`imported_functions`, `exported_functions`, and `libraries` provide useful summaries,
-but format-specific tables retain details that the common view cannot express.
-The entrypoint is a header entry, not necessarily `main`; initializers, TLS
-callbacks, or loader behavior can execute other code first.
+## [S05] Integer and real arithmetic
 
-| Question | Format-specific starting points | Interpretation trap |
-| --- | --- | --- |
-| What is mapped? | ELF `segments`; PE `sections` plus headers; Mach-O `segments` | Section names do not determine loader permissions. |
-| Where is a symbol? | ELF `symtab_symbols`, `dynamic_symbols`, `get_symbol(name)` / `get_dynamic_symbol(name)` | Stripping, symbol versions, duplicates, undefined and TLS symbols matter. |
-| What does PE import? | `binary.imports`; each import has `name`, `entries` | Check `entry.is_ordinal` before using `entry.name`; delay imports are separate. |
-| What does PE export? | `binary.get_export()` then `.entries` | It can return `None`; forwarded exports do not identify local code. |
-| What libraries are declared? | ELF `libraries`; PE imports; Mach-O `libraries` commands | Runtime loading can add undeclared dependencies. |
-| What needs relocation? | ELF `relocations`, `dynamic_relocations`, `pltgot_relocations`; PE `relocations`; Mach-O dyld metadata | Relocation arithmetic depends on machine, type, width, and addend. |
+`Int` is unbounded and `Real` is exact; neither overflows. `+`, `-`, `*`, `/`,
+comparisons, `Sum(*xs)`, and `Abs(x)` construct terms. `ToReal(i)` embeds an
+integer. `ToInt(r)` floors a real, including negative values; `IsInt(r)` asks
+whether its value is integral. Mixed integer/real arithmetic can introduce
+coercions; inspect `.sort()` when unsure.
 
-**Fragment/recipe — inventory a PE; replace the input path:**
+For integer expressions, `/` is integer division and `%` is modulus. With a
+nonzero divisor, Euclidean modulus is nonnegative and smaller than the divisor's
+absolute value. These are not C's truncation/remainder rules for negative
+operands. For reals, `/` is exact division. Arithmetic division by zero is total
+but under-specified in the logic; add a nonzero guard or explicitly model the
+program's error behavior. Do not infer a runtime exception from the SMT term.
+
+Use `RealVal("0.1")` or `RealVal("1/10")` for exact constants. Python computes
+`1 / 3` before Z3 sees it. The resulting host float is not the exact rational
+one third. `RealVal(1) / 3` stays symbolic and exact.
+
+**Runnable example:** check rational and signed-division semantics.
 
 ```python
-import lief
-binary = lief.PE.parse('input.exe')
-if binary is None:
-    raise ValueError('Cannot parse PE')
-for library in binary.imports:
-    for entry in library.entries:
-        target = f'ordinal:{entry.ordinal}' if entry.is_ordinal else entry.name
-        print(library.name, target)
-exports = binary.get_export()
-if exports is not None:
-    for entry in exports.entries:
-        print(entry.ordinal, entry.name, hex(entry.address))
+import z3
+
+third = z3.simplify(z3.RealVal(1) / 3)
+assert third.numerator_as_long() == 1
+assert third.denominator_as_long() == 3
+assert z3.simplify(z3.IntVal(-5) / 2).as_long() == -3
+assert z3.simplify(z3.IntVal(-5) % 2).as_long() == 1
+assert z3.simplify(z3.ToInt(z3.RealVal("-1.2"))).as_long() == -2
 ```
 
-Collect output as evidence of **declared metadata**, not a recovered complete call
-graph. ELF relocation addends can be explicit (RELA) or stored at the relocation
-site (REL); LIEF parsing is not equivalent to applying the target loader. A symbol
-name match does not prove the runtime linker resolves to that exact definition.
+`RatNumRef` supports numerator/denominator extraction. `as_decimal(precision)`
+can print a trailing `?` for a truncated decimal; it is not an exact serialization.
+Nonlinear real solutions can contain `AlgebraicNumRef` values such as square
+roots, which are not rationals. Keep exact ASTs for comparisons. Nonlinear
+integer arithmetic has no general terminating decision procedure; add budgets
+and handle `unknown`.
 
 <a id="s06"></a>
-## [S06] Editing and rebuilding contracts
 
-| API | Parameters, result, and side effects |
-| --- | --- |
-| `binary.patch_address(address, patch_value, va_type=VA_TYPES.AUTO)` | `patch_value` is a sequence of integers in `0..255`; writes the in-memory content; returns `None`. Does not accept a file offset. |
-| `binary.patch_address(address, integer, size=8, va_type=VA_TYPES.AUTO)` | Integer overload; default size is **8 bytes**, potentially wrong for the target. Prefer explicit byte encoding instead. |
-| `ELF.Binary.write(output, config=...)` | Rebuilds to path; returns `None`; optional `ELF.Builder.config_t`. |
-| `PE.Binary.write(output, config=...)` | Rebuilds to path; returns `None`; optional `PE.Builder.config_t`. |
-| `MachO.Binary.write(output, config=...)` | Writes one slice; optional `MachO.Builder.config_t`; returns `None`. |
-| `MachO.FatBinary.write(output)` | Rebuilds the container; returns `None`. Use to preserve multiple slices. |
-| `PE.Builder(binary, config)` | Explicit builder constructor. `build()` returns `lief.ok_t` or `lief.lief_errors`; `write(path)` writes the build result. |
+## [S06] Bitvectors: machine arithmetic, signedness, and casts
 
-A `None` return from a void mutation is not a success flag. Read back the modified
-range in memory, then write and reparse. `write()` is not a byte-preserving copy;
-layout, padding, tables, and metadata can change. It can overwrite an existing path,
-so select a new destination and preserve the original and its hash.
+An `n`-bit value is a bit pattern. Addition, subtraction, multiplication, and
+bitwise operations keep width `n` and wrap modulo `2**n`. Operands normally need
+matching widths. Python integers are coerced to that width: `BitVecVal(256, 8)`
+is zero. This is a frequent cause of accidentally impossible range constraints.
 
-**Fragment/recipe — PE RVA patch; requires a parsed PE and a verified file-backed
-range at `rva`, plus a new output path:**
+| Operation | Signed interpretation | Unsigned interpretation / notes |
+| --- | --- | --- |
+| Compare | `a < b`, `a <= b`, `a > b`, `a >= b` | `ULT`, `ULE`, `UGT`, `UGE` |
+| Divide | `a / b` | `UDiv(a, b)` |
+| Remainder | `SRem(a, b)` follows dividend's sign | `URem(a, b)` |
+| Modulus | `a % b` uses signed modulus, tied to divisor's sign | Use `URem` for unsigned modulus |
+| Right shift | `a >> count` fills with sign bit | `LShR(a, count)` fills with zero |
+| Left shift | `a << count` | Low bits retained; high bits discarded |
+| Bitwise | `a & b`, `a \| b`, `a ^ b`, `~a` | Same bit operation regardless of interpretation |
+| Extend | `SignExt(extra_bits, a)` | `ZeroExt(extra_bits, a)`; argument is added width, not final width |
+| Convert to Int | `BV2Int(a, is_signed=True)` | `BV2Int(a)` defaults to unsigned |
+| Rotate | `RotateLeft(a, count)`, `RotateRight(a, count)` | Preserves width; rotation is different from shift |
+
+`Extract(high, low, a)` selects inclusive bit indices, counting from least
+significant bit zero, and returns width `high - low + 1`.
+`Concat(a, b, ...)` places the first argument at the most significant end.
+`Int2BV(integer_expr, width)` reduces modulo `2**width`; it is not a proof that
+the integer was in range. Mixed Int/BitVec encodings may be more expensive than
+staying in a single theory.
+
+**Runnable example:** edge cases that distinguish these operations.
 
 ```python
-rva = 0x1000  # Placeholder: determine from this target; not a universal code address.
-patch = (0x1234).to_bytes(2, 'little', signed=False)
-kind = lief.Binary.VA_TYPES.RVA
-before = bytes(binary.get_content_from_virtual_address(rva, len(patch), kind))
-if len(before) != len(patch):
-    raise ValueError('Incomplete patch range')
-binary.patch_address(rva, list(patch), kind)
-assert bytes(binary.get_content_from_virtual_address(rva, len(patch), kind)) == patch
-binary.write('patched.exe')
+import z3
+
+ff = z3.BitVecVal(255, 8)
+assert z3.simplify(ff + 1).as_long() == 0
+assert z3.is_true(z3.simplify(ff < 0))
+assert z3.is_false(z3.simplify(z3.ULT(ff, 0)))
+assert z3.simplify(ff >> 1).as_long() == 255
+assert z3.simplify(z3.LShR(ff, 1)).as_long() == 127
+assert z3.simplify(z3.SignExt(8, ff)).as_long() == 65535
+assert z3.simplify(z3.ZeroExt(8, ff)).as_long() == 255
+assert z3.simplify(z3.BV2Int(ff, is_signed=True)).as_long() == -1
+minus_five, two = z3.BitVecVal(-5, 8), z3.BitVecVal(2, 8)
+assert z3.simplify(minus_five / two).as_signed_long() == -2
+assert z3.simplify(z3.SRem(minus_five, two)).as_signed_long() == -1
+assert z3.simplify(minus_five % two).as_signed_long() == 1
 ```
 
-This recipe assumes `import lief` and `binary` from [S05](#s05). It illustrates the
-byte API, not a valid instruction change for an arbitrary executable. Instruction
-patches must respect architecture, instruction boundaries, relative operands,
-unwind metadata, branch targets, and relocation sites.
+### Model the instruction or language, not just the bit width
 
-For structural edits, use the new object returned by `add`/`add_section`, not the
-unattached input object, to inspect assigned addresses. After rebuilding, reacquire
-all offsets and verify content in the reparsed binary. Restore executable file
-permissions intentionally when replaying an ELF; do not assume writing preserves
-the source mode. See the complete [ELF lab](#s10).
+SMT bitvector shifts do not automatically mask counts as some CPUs do. For
+example, an x86 32-bit shift's masked count needs a corresponding mask in the
+encoding. Account for instruction-specific flag and exceptional behavior.
+Bitvector division has defined zero-divisor semantics, not a CPU divide fault;
+signed minimum divided by minus one also needs explicit handling when the target
+traps. Add guards or encode the exceptional branch.
+
+C integer promotions can widen byte operands before arithmetic. Signed C
+overflow can be undefined, while an executed machine add wraps. Decide whether
+you are modeling source-language defined executions or actual instructions.
+For an unsigned carry, widen operands by one bit before adding and inspect the
+high bit. An `n`-bit sum alone has already lost the carry.
+
+**Fragment/recipe:** for two equally wide bitvectors `a` and `b`, let
+`wide = ZeroExt(1, a) + ZeroExt(1, b)` and
+`carry = Extract(a.size(), a.size(), wide) == 1`. Supply the correct operands
+and instruction semantics; this does not model every arithmetic flag.
 
 <a id="s07"></a>
-## [S07] ELF operations
 
-`ELF.Binary` exposes headers, sections, program segments, dynamic entries, symbols,
-relocations, notes, and interpreter information. For runtime layout, start with
-`PT_LOAD` segments; section headers can be absent from otherwise loadable files.
+## [S07] Solver API and three-way results
 
-| Task | API / essential behavior |
+These are common public call forms; optional internal constructor arguments are
+omitted. `Solver()` is a good starting point. `SolverFor("QF_BV")` selects a
+logic-specific configuration; choose it only when the formula fits that logic.
+`QF` means quantifier-free; `BV`, `LIA`, `LRA`, and `NRA` denote bitvectors,
+linear integer arithmetic, linear real arithmetic, and nonlinear real arithmetic.
+
+| Call | Parameters, result, and state effects |
 | --- | --- |
-| Get a section | `get_section(name: str) -> Section | None`. |
-| Add metadata section | `Section(name, type=Section.TYPE.PROGBITS)`; set `.content`; `binary.add(section, loaded=False) -> Section | None`. Default `loaded=True` would request a loaded section. |
-| Add a load segment | `binary.add(segment, base=0) -> Segment | None`; layout/alignment and permissions require target-specific verification. |
-| Add dependency | `binary.add_library(name: str) -> DynamicEntryLibrary`; adds a declaration, not symbol calls or a bundled library. |
-| Remove dependency | `binary.remove_library(name: str) -> None`; can break unresolved references. |
-| Query dynamic tag | `binary.get(lief.ELF.DynamicEntry.TAG.RUNPATH) -> DynamicEntry | None`; `.has(tag)` gives a boolean. |
-| Add dynamic entry | `binary.add(entry: DynamicEntry) -> DynamicEntry`; avoid duplicate singleton tags. |
+| `Solver(ctx=None)` | New solver with no assertions, in the chosen/default context. |
+| `s.add(*constraints)` | Boolean expressions (also accepts a list); adds persistent assertions; returns `None`. Does not solve. |
+| `s.check(*assumptions)` | Checks persistent assertions plus temporary Boolean assumptions; returns `CheckSatResult`: compare with `sat`, `unsat`, `unknown`. |
+| `s.model()` | Returns `ModelRef` for the last successful query. Use only after `sat`; otherwise may raise `Z3Exception` or offer no justified witness. |
+| `s.set(timeout=5000)` | Per-solver timeout in milliseconds; zero means no timeout. Settings are not asserted formulas. |
+| `s.set(rlimit=...)` | Internal resource budget, not milliseconds; work units depend on version and solver behavior. |
+| `s.reason_unknown()` | Diagnostic string after `unknown`; do not match exact wording as a stable interface. |
+| `s.assertions()` | Current assertions as an `AstVector`; assumptions passed to `check` are not persistent assertions. |
+| `s.push()` / `s.pop(n=1)` | Save an assertion scope / discard the last `n` scopes and their additions. Popping too far is an error. |
+| `s.reset()` | Removes assertions and scopes; reapply intended settings explicitly when reusing it. |
+| `s.statistics()` | Last-check statistics; keys depend on the engine/version. |
+| `s.to_smt2()` / `s.sexpr()` | Text representations useful for recording/debugging; see [S16](#s16). |
+| `s.help()` / `s.param_descrs()` | Available parameter descriptions; `help()` prints them. Unsupported settings can fail when set or when solving starts. |
 
-**Fragment/recipe — inspect RUNPATH on an existing parsed ELF:**
+After adding constraints or changing scopes, call `check()` again before using
+results. A saved old model remains a model of its old query; it need not satisfy
+the new one. Solver settings and assertion scopes are different things; do not
+expect `pop()` to undo parameter changes.
 
-```python
-import lief
-entry = binary.get(lief.ELF.DynamicEntry.TAG.RUNPATH)
-if entry is not None:
-    print(entry.runpath)
-```
+| Result | Valid conclusion | Next action |
+| --- | --- | --- |
+| `sat` | At least one model satisfies this query. | Extract correlated values and validate the encoding/replay. |
+| `unsat` | No model satisfies all assertions and current assumptions. | Inspect an unsat core or use the result as a proof under stated assumptions. |
+| `unknown` | The solver did not establish either result. | Record `reason_unknown()`, budget and formula; simplify or revise strategy. |
 
-RPATH and RUNPATH have different loader search semantics. `$ORIGIN` is loader
-syntax and must remain literal when passed through shells. Changing the
-interpreter or search path does not guarantee the library ABI exists on another
-host. Symbol renaming can require coordinated references, versioning, hash tables,
-and string-table updates; changing one arbitrary name is not a general ABI rewrite.
-
-`ELF.Builder.config_t()` has many rebuild controls. In this build `notes=False`,
-`force_relocate=False`, `skip_dynamic=False`; common dynamic tables and static
-symbols are enabled. If modifying notes, explicitly review `config.notes`.
-Builder switches are not permission to discard structures the analysis skipped.
-
-Reference: [ELF Python API](https://lief.re/doc/stable/formats/elf/python.html).
+Do not use `if s.check():`, compare with strings, or catch every exception and
+label it `unsat`. A sort error is a modeling/programming error; a library-loading
+failure is an environment error. For an overall wall-clock limit, also bound the
+host process: the solver timeout does not budget all Python encoding, parsing,
+model extraction, or a sequence of many checks.
 
 <a id="s08"></a>
-## [S08] PE operations
 
-Separate `header` (COFF metadata) from `optional_header` (PE image metadata).
-Despite its name, the latter is needed for a normal PE image. `imagebase` is a
-preferred base; the loader can relocate it. Section `virtual_size` and
-`sizeof_raw_data` differ; raw alignment padding is not extra meaningful code.
+## [S08] Models, concrete values, and uniqueness
 
-| Task | API / essential behavior |
+`m.eval(expr, model_completion=False)` (alias `evaluate`) evaluates an expression
+in a `ModelRef` and returns a Z3 expression. With default completion disabled,
+an unconstrained symbol can remain symbolic. With completion enabled, Z3 adds
+interpretations as needed to this model; those choices are arbitrary and may
+mutate its displayed contents.
+
+| Value | Conversion after evaluation |
 | --- | --- |
-| Find RVA section | `section_from_rva(rva: int) -> Section | None`; validate the requested range, not just its first byte. |
-| Add section | `Section(name)` then `.content`, `.characteristics`; `add_section(section) -> Section | None`. Old two-argument section-type recipes are not the 1.0.0 signature. |
-| Add DLL import | `add_import(import_name: str, pos=-1) -> Import`; default appends. |
-| Add function import | `import_object.add_entry(function_name: str) -> ImportEntry`. |
-| Inspect exports | `get_export() -> Export | None`; enable `config.exports=True` when rebuilding edited exports. |
-| Resources / TLS | `resources`, `resources_manager`, `tls`; check presence before descending into format-specific objects. |
-| Verify signatures | `verify_signature(checks=Signature.VERIFICATION_CHECKS.DEFAULT) -> Signature.VERIFICATION_FLAGS`. Interpret flags, not truthiness as success. |
+| Integer numeral | `.as_long()` → Python integer |
+| Bitvector numeral | `.as_long()` → unsigned integer; `.as_signed_long()` → two's-complement signed integer |
+| Boolean literal | `is_true(value)` / `is_false(value)`; reject a residual symbolic value |
+| Rational numeral | `.numerator_as_long()` and `.denominator_as_long()` |
+| String literal | `.as_string()` → Python string, not raw input bytes |
+| Array / function | Evaluate selected applications; inspect the interpretation only when necessary |
 
-To preserve import edits, create `config = lief.PE.Builder.config_t()`, set
-`config.imports = True`, and call `binary.write(output, config)`. The analogous
-exports switch is also false by default. In contrast, resources, relocations,
-load configuration, TLS, debug, and overlay controls default to true in this build.
-Adding an import does not insert a call instruction; import rebuilding can affect
-IAT layout, so existing code references require additional validation.
+`m[x]` retrieves a declared constant's interpretation and can be `None` if
+unconstrained. Prefer `eval` for compound expressions. A displayed assignment
+is neither a canonical result nor evidence of uniqueness. To prove a projected
+value is unique, add `expr != value` temporarily and require `unsat`.
 
-Authenticode verification concerns signature/digest consistency under chosen
-checks. It is not a malware verdict or a substitute for platform trust policy,
-revocation, and signing requirements. Changes to signed content can invalidate
-signatures. The PE certificate directory uses a file offset, an exception to the
-usual RVA interpretation of data directories. Do not run all directory values
-through `rva_to_offset` indiscriminately.
+**Runnable example:** complete an unconstrained value and test uniqueness.
 
-References: [PE Python API](https://lief.re/doc/stable/formats/pe/python.html),
-[Authenticode tutorial](https://lief.re/doc/stable/tutorials/13_pe_authenticode.html).
+```python
+import z3
+
+x, unused = z3.Ints("x unused")
+s = z3.Solver()
+s.add(x == 12)
+assert s.check() == z3.sat
+m = s.model()
+v = m.eval(x)
+assert v.as_long() == 12
+assert z3.is_int_value(m.eval(unused, model_completion=True))
+s.push()
+s.add(x != v)
+assert s.check() == z3.unsat
+s.pop()
+assert s.check(unused != 0) == z3.sat  # completion did not constrain the solver
+```
+
+Extract every byte of a candidate from the same model. Calling separate solvers
+for different bytes can produce mutually inconsistent choices. Preserve bytes
+exactly, including zero and newline bytes; lossy decoding or stripping changes
+the candidate. See [the complete byte example](#s17).
 
 <a id="s09"></a>
-## [S09] Mach-O operations
 
-`fat = lief.MachO.parse(input)` returns a container. Check `fat is not None`, keep
-it alive, then iterate slices or select with
-`fat.get(lief.MachO.Header.CPU_TYPE.X86_64)`. `fat.at(index)` and `fat.get(cpu)` can
-return `None`. Inspect CPU subtype too when the exact ABI matters.
+## [S09] Incremental queries, assumptions, and unsat cores
 
-**Fragment/recipe — inspect all slices; replace the input path:**
+Use `push`/`pop` for temporary assertions. Pair them with `try`/`finally` in
+application code so exceptions do not leak scopes. Use `check(*assumptions)` for
+short-lived conditions, often fresh Boolean activation literals. The returned
+model or core is for that specific check, including its assumptions.
+
+`assert_and_track(constraint, label)` asserts a formula and attaches a Boolean
+constant (or string name) for core reporting. Use fresh, unique labels and keep
+a label-to-source map. Tracking labels are not switches for disabling formulas;
+use `Implies(label, formula)` plus explicit check assumptions for that purpose.
+
+`unsat_core()` returns an `AstVector` of relevant labels/assumptions after
+`unsat`. It explains inconsistency relative to all untracked background
+assertions. It need not contain every cause, be minimal, or be a proof object.
+An empty core can mean the background is already inconsistent.
+
+**Runnable example:** obtain a core and independently recheck its formulas.
 
 ```python
-import lief
-fat = lief.MachO.parse('input.macho')
-if fat is None:
-    raise ValueError('Cannot parse Mach-O')
-for binary in fat:
-    print(binary.header.cpu_type, binary.header.cpu_subtype)
-    section = binary.get_section('__TEXT', '__text')
-    if section is not None:
-        print(section.virtual_address, len(bytes(section.content)))
+import z3
+
+x = z3.Int("x")
+rules = {"positive": x > 0, "negative": x < 0, "ceiling": x < 100}
+s = z3.Solver()
+for label, formula in rules.items():
+    s.assert_and_track(formula, label)
+assert s.check() == z3.unsat
+names = {str(label) for label in s.unsat_core()}
+assert {"positive", "negative"} <= names
+recheck = z3.Solver()
+recheck.add(*[rules[name] for name in names])
+assert recheck.check() == z3.unsat
 ```
 
-Use segment-plus-section lookup because section names can repeat across segments.
-`binary.commands` exposes load commands; `binary.libraries` provides linked dylib
-commands. `binary.add_library(name: str) -> LoadCommand | None` adds a dependency.
-Path tokens such as `@rpath`, `@loader_path`, and `@executable_path` are interpreted
-by dyld, not expanded by LIEF into a complete runtime environment.
+**Runnable example:** optional constraints activated per query.
 
-Writing a slice with `binary.write(path)` does not preserve other architectures.
-Use `fat.write(path)` for the container. Load-command growth, chained fixups,
-exports, bindings, rebases, encryption, and code signing can complicate edits.
-Rebuilding is not re-signing; macOS/iOS runtime validation requires the applicable
-platform tooling. The [lab](#s12) validates an object file only, not a signed app.
+```python
+import z3
 
-Reference: [Mach-O Python API](https://lief.re/doc/stable/formats/macho/python.html).
+x = z3.Int("x")
+low, high = z3.Bools("enable_low enable_high")
+s = z3.Solver()
+s.add(z3.Implies(low, x < 2), z3.Implies(high, x > 5))
+assert s.check(low, high) == z3.unsat
+assert s.check(low, z3.Not(high)) == z3.sat
+assert s.model().eval(x).as_long() < 2
+```
+
+Omitting an activation literal leaves it unconstrained; it does not force it
+false. Supply `Not(label)` when disabling it is itself part of the query.
 
 <a id="s10"></a>
-## [S10] Complete ELF lab: patch data, add metadata, replay
 
-**Runnable example — Linux x86-64, `cc` on PATH, writable temporary storage.**
-Creates and executes only its own small C program. This example is independent
-of other snippets and includes its entire fixture. It checks the original bytes,
-file mapping, patched bytes, metadata survival, and native output.
+## [S10] Proving properties and enumerating projected models
+
+A satisfiability query asks for an assignment. A validity query asks whether a
+property holds for every assignment satisfying the assumptions. Negate the
+property and look for a counterexample. `unsat` proves the property only for
+the model you encoded; inconsistent assumptions prove everything vacuously.
+
+**Runnable example:** prove a wrapped arithmetic identity.
 
 ```python
-from pathlib import Path
-import os
-import subprocess
-import tempfile
-import lief
+import z3
 
-source = r'''
-#include <stdio.h>
-char message[] = "before";
-int main(void) { puts(message); return 0; }
-'''
-with tempfile.TemporaryDirectory() as directory:
-    root = Path(directory)
-    cfile, original, output = root/'main.c', root/'original', root/'patched'
-    cfile.write_text(source)
-    subprocess.run(['cc', '-O0', '-fno-pie', '-no-pie', str(cfile),
-                    '-o', str(original)], check=True)
-    def run(path):
-        return subprocess.check_output([str(path)], timeout=5)
-    assert run(original) == b'before\n'
-    binary = lief.ELF.parse(original)
-    assert binary is not None
-    symbol = binary.get_symbol('message')
-    assert symbol is not None and symbol.size == 7
-    address = symbol.value
-    old, new = b'before\0', b'after!\0'
-    assert len(old) == len(new)
-    mappings = [s for s in binary.segments
-                if s.type == lief.ELF.Segment.TYPE.LOAD
-                and s.virtual_address <= address
-                and address + len(old) <= s.virtual_address + s.physical_size]
-    assert len(mappings) == 1
-    offset = binary.virtual_address_to_offset(address)
-    assert not isinstance(offset, lief.lief_errors)
-    assert original.read_bytes()[offset:offset + len(old)] == old
-    assert bytes(binary.get_content_from_virtual_address(address, len(old))) == old
-    binary.patch_address(address, list(new))
-    metadata = lief.ELF.Section('.agent')
-    metadata.content = list(b'LIEF reference fixture')
-    assert binary.add(metadata, loaded=False) is not None
-    config = lief.ELF.Builder.config_t()
-    config.notes = True  # Preserve/rebuild notes when the section layout changes.
-    binary.write(output, config)
-    rebuilt = lief.ELF.parse(output)
-    assert rebuilt is not None
-    updated = rebuilt.get_symbol('message')
-    assert updated is not None
-    assert bytes(rebuilt.get_content_from_virtual_address(updated.value, 7)) == new
-    section = rebuilt.get_section('.agent')
-    assert section is not None
-    assert bytes(section.content) == b'LIEF reference fixture'
-    os.chmod(output, original.stat().st_mode & 0o777)
-    assert run(output) == b'after!\n'
-    assert run(original) == b'before\n'
-print('ELF lab passed')
+x = z3.BitVec("x", 16)
+s = z3.Solver()
+assert s.check() == z3.sat  # assumptions are consistent
+s.add(z3.Not((x + 1) - 1 == x))
+assert s.check() == z3.unsat
 ```
 
-The result is a witness that this edit works for this compiled fixture and host.
-It does not prove arbitrary ELF edits preserve behavior. The non-PIE compilation
-makes the mapping simple; PIE and runtime patching require [S04](#s04).
+`z3.prove(...)` and `z3.solve(...)` are useful interactive printing helpers.
+Use an explicit `Solver` and result handling for agent automation.
+
+To enumerate a projection `[x, y]`, extract both values from one model and add
+`Or(x != vx, y != vy)`. This excludes that pair and preserves pairs differing
+in either component. Adding both inequalities separately discards valid pairs.
+Projection avoids enumerating irrelevant internal symbols and function models.
+
+**Runnable example:** enumerate a finite domain with an explicit bound.
+
+```python
+import z3
+
+x, y = z3.Ints("x y")
+s = z3.Solver()
+s.set(timeout=5000)
+s.add(x >= 0, x <= 3, y >= 0, y <= 3, x + y == 3)
+seen = set()
+limit = 10
+complete = False
+for _ in range(limit):
+    result = s.check()
+    if result == z3.unsat:
+        complete = True
+        break
+    if result == z3.unknown:
+        raise RuntimeError(s.reason_unknown())
+    m = s.model()
+    vx, vy = m.eval(x), m.eval(y)
+    seen.add((vx.as_long(), vy.as_long()))
+    s.add(z3.Or(x != vx, y != vy))
+assert complete  # only final UNSAT establishes exhaustion
+assert seen == {(0, 3), (1, 2), (2, 1), (3, 0)}
+```
+
+If the loop hits its limit, report a partial enumeration even if the last model
+happened to be the final one. Unbounded integers, reals, arrays, and functions
+usually make full-model enumeration inappropriate.
 
 <a id="s11"></a>
-## [S11] Complete PE lab: synthetic image, section and import rebuild
 
-**Runnable example — any host with LIEF and writable temporary storage.**
-Constructs a minimal x86-64 PE fixture with `struct`; no download, cross compiler,
-or Windows is required. It is a parser/builder fixture, **not a validated runnable
-Windows application**. Its sparse headers can produce a diagnostic about RVA 0;
-the assertions below check the specific structures under test.
+## [S11] Arrays, symbolic memory, and byte order
+
+`Array(name, index_sort, value_sort)` creates a total mathematical map.
+`Select(a, i)` (or `a[i]`) reads it. `Store(a, i, v)` returns a new array term
+with that entry changed; it does not mutate `a`. `K(index_sort, value)` creates
+a constant array. Array equality is extensional: all corresponding entries
+must agree. An array has no implicit allocation size or invalid addresses.
+
+For byte-addressed memory, use an address bitvector sort and eight-bit values.
+Constrain valid addresses, initialized regions, aliasing, and faults yourself.
+A fresh unconstrained array gives unconstrained contents; `K(..., 0)` instead
+asserts that every entry starts at zero, a stronger modeling assumption.
+
+**Runnable example:** store and load a little-endian 32-bit word.
 
 ```python
-from pathlib import Path
-import struct
-import tempfile
-import lief
+import z3
 
-raw = bytearray(0x400)
-raw[:2] = b'MZ'
-struct.pack_into('<I', raw, 0x3c, 0x80)
-raw[0x80:0x84] = b'PE\0\0'
-# AMD64, one section, 240-byte PE32+ optional header, executable/large-address flags.
-struct.pack_into('<HHIIIHH', raw, 0x84, 0x8664, 1, 0, 0, 0, 0xf0, 0x22)
-o = 0x98
-struct.pack_into('<H', raw, o, 0x20b)
-struct.pack_into('<I', raw, o + 16, 0x1000)       # Entrypoint RVA
-struct.pack_into('<Q', raw, o + 24, 0x140000000)  # Image base
-struct.pack_into('<II', raw, o + 32, 0x1000, 0x200)  # Section/file alignment
-struct.pack_into('<II', raw, o + 56, 0x2000, 0x200)  # Image/header sizes
-struct.pack_into('<H', raw, o + 68, 3)           # Console subsystem
-struct.pack_into('<I', raw, o + 108, 16)         # Number of data directories
-struct.pack_into('<8sIIIIIIHHI', raw, o + 0xf0,
-                 b'.text', 1, 0x1000, 0x200, 0x200, 0, 0, 0, 0, 0x60000020)
-raw[0x200] = 0xc3  # x86 RET, not executed in this lab.
-binary = lief.PE.parse(bytes(raw))
-assert binary is not None
-kind = lief.Binary.VA_TYPES.RVA
-assert binary.rva_to_offset(0x1000) == 0x200
-assert bytes(binary.get_content_from_virtual_address(0x1000, 1, kind)) == b'\xc3'
-section = lief.PE.Section('.agent')
-section.content = list(b'LIEF')
-section.characteristics = 0x40000040  # Readable initialized data
-assert binary.add_section(section) is not None
-library = binary.add_import('KERNEL32.dll')
-library.add_entry('GetCurrentProcessId')
-config = lief.PE.Builder.config_t()
-config.imports = True
-with tempfile.TemporaryDirectory() as directory:
-    output = Path(directory)/'rebuilt.exe'
-    binary.write(output, config)
-    rebuilt = lief.PE.parse(output)
-    assert rebuilt is not None
-    metadata = rebuilt.get_section('.agent')
-    assert metadata is not None and bytes(metadata.content) == b'LIEF'
-    imports = {(lib.name.lower(), entry.name)
-               for lib in rebuilt.imports for entry in lib.entries
-               if not entry.is_ordinal}
-    assert ('kernel32.dll', 'GetCurrentProcessId') in imports
-    assert bytes(rebuilt.get_content_from_virtual_address(0x1000, 1, kind)) == b'\xc3'
-print('PE lab passed')
+memory = z3.Array("memory", z3.BitVecSort(64), z3.BitVecSort(8))
+address = z3.BitVecVal(0x1000, 64)
+word = z3.BitVec("word", 32)
+updated = memory
+for offset in range(4):
+    byte = z3.Extract(8 * offset + 7, 8 * offset, word)
+    updated = z3.Store(updated, address + offset, byte)
+loaded = z3.Concat(*[z3.Select(updated, address + i) for i in (3, 2, 1, 0)])
+s = z3.Solver()
+s.add(loaded != word)
+assert s.check() == z3.unsat
+s.reset()
+s.add(word == 0x12345678)
+assert s.check() == z3.sat
+m = s.model()
+raw = bytes(m.eval(z3.Select(updated, address + i)).as_long() for i in range(4))
+assert raw == b"\x78\x56\x34\x12"
 ```
 
-This verifies metadata preservation through a rebuild. It does not verify Windows
-loading, IAT references in existing code, API calling convention, signing, or
-behavior on a real PE application.
+The addresses here are fixed, distinct, and do not wrap. A symbolic pointer near
+the address-space boundary needs extra constraints. For a small fixed input
+buffer, a Python list of byte variables is often simpler than an SMT array;
+symbolic list indices require a different encoding (`If` selection or an array).
 
 <a id="s12"></a>
-## [S12] Complete Mach-O lab: inspect a compiler-created object
 
-**Runnable example — `clang` on PATH with an x86-64 Darwin target, temporary storage.**
-No Apple SDK or linker is required because the source uses no headers and is only
-compiled to an object. Nothing in this example executes Mach-O machine code.
+## [S12] Uninterpreted functions and algebraic datatypes
+
+`Function(name, domain_sort, ..., range_sort)` declares a total uninterpreted
+function. Equal arguments imply equal results, but there is no other behavior
+until constrained. It is not an arbitrary fresh return value per call and does
+not execute Python. `DeclareSort(name)` declares an uninterpreted, nonempty sort;
+it does not impose a finite cardinality.
+
+For an unknown pure function, an uninterpreted function may be a useful
+abstraction. For stateful behavior, include the relevant state in its arguments
+or model state transitions explicitly. Omitting behavior can admit spurious
+witnesses. Replay concrete candidates and refine the model as necessary.
+
+**Runnable example:** congruence forces equal outputs for equal inputs.
 
 ```python
-from pathlib import Path
-import subprocess
-import tempfile
-import lief
+import z3
 
-with tempfile.TemporaryDirectory() as directory:
-    root = Path(directory)
-    source, obj = root/'tiny.c', root/'tiny.o'
-    source.write_text('int answer(void) { return 42; }\n')
-    subprocess.run(['clang', '-target', 'x86_64-apple-darwin', '-c',
-                    str(source), '-o', str(obj)], check=True)
-    fat = lief.MachO.parse(obj)
-    assert fat is not None and fat.size == 1
-    binary = fat.get(lief.MachO.Header.CPU_TYPE.X86_64)
-    assert binary is not None
-    section = binary.get_section('__text')
-    assert section is not None
-    original_code = bytes(section.content)
-    assert original_code
-    assert '_answer' in {symbol.name for symbol in binary.symbols}
-    again = lief.MachO.parse(obj.read_bytes())
-    assert again is not None and again.size == 1
-    rebuilt = again.at(0)
-    assert rebuilt is not None
-    text = rebuilt.get_section('__text')
-    assert text is not None and bytes(text.content) == original_code
-    assert '_answer' in {symbol.name for symbol in rebuilt.symbols}
-print('Mach-O lab passed')
+f = z3.Function("f", z3.IntSort(), z3.IntSort())
+x, y = z3.Ints("x y")
+s = z3.Solver()
+s.add(x == y, f(x) != f(y))
+assert s.check() == z3.unsat
 ```
 
-This exercises path/raw-byte parsing and the thin-input container API. This
-compiler emits an unnamed enclosing segment for its object file, so the example
-uses the unique section name instead of segment-plus-section lookup. A trial
-`fat.write()` round-trip on this fixture produced an nlist parsing diagnostic and
-lost the symbol table on reparse with the tested build. Consequently this lab does
-not claim object-file writer support; do not use that transformation without
-resolving the failure. Universal executables, dyld fixups, and platform signature
-enforcement need separate tests.
+`EnumSort(name, names)` returns a finite sort and its distinct constructors.
+`Datatype(name)` starts a datatype declaration; `declare` adds constructors and
+fields; `create()` finalizes it. Constructors are disjoint and injective;
+recognizers test the constructor. Accessors applied to the wrong constructor
+are under-specified, so guard their use. For mutually recursive datatypes use
+`CreateDatatypes(...)` after declaring all types.
+
+**Runnable example:** a tagged optional integer.
+
+```python
+import z3
+
+Maybe = z3.Datatype("MaybeInt")
+Maybe.declare("missing")
+Maybe.declare("present", ("value", z3.IntSort()))
+Maybe = Maybe.create()
+v = z3.Const("v", Maybe)
+s = z3.Solver()
+s.add(Maybe.is_present(v), Maybe.value(v) == 9)
+assert s.check() == z3.sat
+assert z3.is_true(s.model().eval(v == Maybe.present(9)))
+```
+
+Recursive datatypes describe finite constructor trees. Recursive functions are
+separate: `RecFunction(...)` declares one and `RecAddDefinition(f, args, body)`
+supplies its equation. Recursion does not give automatic induction or guarantee
+termination of all queries. Use bounded unfolding or a dedicated proof strategy.
 
 <a id="s13"></a>
-## [S13] Searchable troubleshooting
 
-| Symptom | Likely cause | Next action |
-| --- | --- | --- |
-| `ModuleNotFoundError: lief` | Wrong interpreter/environment | Use the project's `.venv/bin/python`; inspect `lief.__file__`. |
-| Missing enum or `TypeError` for an old builder | Release mismatch | Check installed `help()`; use nested enums and `Builder(binary, config)`. |
-| Parse returns `None` | Unsupported, truncated, inaccessible, or wrong-format input | Confirm bytes, file size, format and diagnostics; do not report an empty binary. |
-| Parse returns object but tables are missing | Disabled parsing, stripping, damage, or unsupported structure | Check config and raw format headers; record uncertainty. |
-| Patch has no effect or wrong bytes | RVA/VA/file-offset confusion; BSS; out-of-range patch | Validate full file-backed range; read back bytes before and after rebuilding. |
-| Integer patch overwrites neighboring data | Integer overload defaults to 8 bytes | Encode explicit width/endianness and pass a byte sequence. |
-| Added PE imports/exports disappear | Builder switches default false | Enable `imports`/`exports` and inspect reparsed tables. |
-| ELF note edits disappear | Notes rebuilding disabled | Review `ELF.Builder.config_t().notes` and validate the written note. |
-| Rebuilt ELF cannot execute | Mode bits, interpreter/dependencies, layout, or relocation damage | Check permissions and loader metadata; replay only in the intended environment. |
-| Output parses but crashes | Parse success is only a structural check | Validate instructions, ABI, relocations, loader rules, and behavior. |
-| Mach-O loses architectures | Wrote a slice instead of container | Keep `FatBinary` and write the container; verify CPU list afterward. |
-| A retained object/view becomes invalid | Parent lifetime or structural mutation | Keep parent alive; copy bytes; reacquire references after edits. |
-| Signature verification fails after edit | Signed content changed | Verify actual flags and use the platform signing workflow if needed. |
-| Memory/time exhausted or native crash | Input complexity or native-parser bug | Isolate parsing, impose external limits, preserve a reproducer and version. |
+## [S13] Quantifiers, triggers, and verification conditions
 
-Do not suppress parser diagnostics while developing a transformation. When a
-method reports `lief_errors`, keep the error value in the result record rather
-than coercing it to an address or treating it as an empty successful result.
+`ForAll([x, ...], body)` and `Exists([x, ...], body)` bind the listed constants in
+the body. Free constants in a satisfiability query are already existentially
+chosen, so `Exists` is often unnecessary for ordinary input recovery. Quantifier
+order matters: `ForAll(x, Exists(y, ...))` lets `y` depend on `x`; reversing the
+order asks for one `y` that works for every `x`.
 
-<a id="s14"></a>
-## [S14] Advanced boundaries and integration
+`ForAll(..., patterns=[f(x)])` supplies a trigger for instantiation; `qid="name"`
+labels a quantifier for diagnostics. Patterns must cover bound variables (a
+`MultiPattern` can cover them jointly) and use suitable applications. They do
+not alter the intended formula, but they can drastically change whether search
+finishes. Poor patterns can prevent useful instantiations or generate endless
+new matching terms.
 
-**Large-file inspection:** disable only structures irrelevant to a read-only
-question, and record the configuration. Avoid copying every section when a small
-range is sufficient. The parser does native work; no solver timeout is involved.
-An externally killed parse is an incomplete operation, not evidence of absence.
-
-**Memory dumps:** runtime relocations, unmapped section headers, zero-filled data,
-and missing file-only regions make dumps different from original file images.
-Specialized memory-aware options do not reconstruct arbitrary missing data.
-Preserve mapping information and validate every claimed file conversion.
-
-**Extended features:** `lief.__extended__` indicates the build flavor. Advanced
-DWARF/PDB, disassembly/assembly, Objective-C, and dyld shared-cache facilities can
-require LIEF Extended. This guide's tests use the standard build. Do not assume a
-method seen on the online Extended pages is available in ReversEnv.
-
-**Other formats:** COFF object files and Android DEX/OAT/VDEX/ART have dedicated
-models. A successful parse does not imply a full symmetric writer exists or that
-ELF/PE address rules apply. Their detailed APIs are outside this reference's
-validated scope.
-
-**angr / disassemblers:** use LIEF to inspect or rebuild the file, and reload the
-output into the analysis tool. Cached CFGs, bytes, and symbols describe the old
-image. angr's loaded addresses may be rebased; translate with the loader's actual
-mapping rather than guessing from LIEF offsets. LIEF never establishes symbolic
-reachability or equivalence. A successful native replay is a witness for tested
-inputs; proof requires a separate model, assumptions, and verification argument.
-
-**Result record:** include input/output hashes; Python and LIEF versions; target
-format/CPU/endianness; parser/builder settings; slice identity; original address
-domain and conversion; expected old/new bytes; rebuild/reparse outcomes; runtime
-test outcome; diagnostics; and untested cases. Avoid claims that metadata
-inspection establishes behavior in all loader environments.
-
-<a id="s15"></a>
-## [S15] Validation, reproduction, and primary sources
-
-Validation environment: **CPython 3.12.14**, **LIEF 1.0.0-d05b3499b**, standard
-build, **Linux x86-64**, checked **2026-09-25**. Repository pin: **lief==1.0.0**;
-the tested base version matches. The suffix identifies the installed LIEF build.
-
-Validation results are recorded below after execution. To reproduce, save each
-**Runnable example** Python block separately and execute it with
-`ReversEnv/.venv/bin/python`. They include all fixture source and create temporary
-outputs. Do not run Fragment/recipe blocks as if they were complete programs.
-
-- S01: six doctest checks passed.
-- S02: ELF path/raw-bytes parsing, section content and file-offset assertions passed.
-- S10: ELF compilation, symbol lookup, mapping, patch, non-loaded section insertion,
-  rebuild with `config.notes=True`, reparse, and original/patched native output
-  assertions passed. Default notes handling initially emitted note diagnostics
-  after section insertion; explicitly rebuilding notes removed those diagnostics.
-- S11: synthetic PE RVA conversion, section insertion, import rebuilding, and
-  reparsed content/import assertions passed. Sparse-fixture RVA diagnostic noted.
-- S12: Mach-O object compilation, architecture selection, symbol/content checks,
-  and path/raw-byte parse assertions passed. A separate attempted object write
-  failed symbol-table preservation; this limitation is documented in S12.
-- All internal anchor links resolved and Markdown fences were balanced.
-
-Not tested: recipe input placeholders, real Windows/macOS execution, multi-slice
-Mach-O, signed binaries, resource/TLS/export modifications, ELF dependency or
-RUNPATH changes, big-endian/32-bit targets, memory dumps, malformed-input robustness,
-Extended features, and Android/COFF workflows. API inspection alone is not an
-execution test. Compiler-generated fixture bytes can differ between toolchains.
-
-### Re-run the executable blocks and document checks
-
-**Fragment/recipe — maintenance harness, run from ReversEnv's root with its Python.**
-This intentionally executes only this trusted document's Runnable example blocks.
-It also executes the doctest block. It requires the compilers listed in the labs.
+**Runnable example:** instantiate a simple quantified function axiom.
 
 ```python
-from pathlib import Path
-import doctest
-import re
-import subprocess
-import sys
-import tempfile
+import z3
 
-path = Path('doc/z3-doc.md')
-text = path.read_text()
-parts = re.split(r'^<a id="s\d+"></a>\s*$', text, flags=re.M)
-count = 0
-with tempfile.TemporaryDirectory() as directory:
-    for part in parts:
-        if not re.search(r'^\*\*Runnable example —', part, re.M):
-            continue
-        blocks = re.findall(r'^```python\n(.*?)^```\s*$', part, re.M | re.S)
-        assert len(blocks) == 1
-        script = Path(directory)/f'example_{count}.py'
-        script.write_text(blocks[0])
-        subprocess.run([sys.executable, str(script)], check=True, timeout=60)
-        count += 1
-assert count == 4
-interactive = '\n\n'.join(re.findall(r'^```pycon\n(.*?)^```\s*$', text, re.M | re.S))
-parser = doctest.DocTestParser()
-runner = doctest.DocTestRunner()
-runner.run(parser.get_doctest(interactive, {}, str(path), str(path), 0))
-result = runner.summarize()
-assert result.failed == 0 and result.attempted == 6
-anchors = re.findall(r'<a id="([^"]+)"></a>', text)
-assert len(anchors) == len(set(anchors))
-assert set(re.findall(r'\]\(#([^)]*)\)', text)) <= set(anchors)
-fence_open = False
-for line in text.splitlines():
-    if line.startswith('```'):
-        if fence_open:
-            assert line == '```'
-        fence_open = not fence_open
-assert not fence_open
-print('4 runnable examples, 6 doctests, anchors and fences passed')
+x = z3.Int("x")
+f = z3.Function("successor", z3.IntSort(), z3.IntSort())
+s = z3.Solver()
+s.set(timeout=5000)
+s.add(z3.ForAll([x], f(x) == x + 1, patterns=[f(x)], qid="successor_rule"))
+s.add(f(8) != 9)
+assert s.check() == z3.unsat
 ```
 
-### Source/version record
+For a small, known finite range, instantiate a Python loop over that range
+instead of quantifying over all integers. This is equivalent only if the intended
+domain really is that finite range. E-matching uses ground terms and equality
+information to instantiate patterns; model-based quantifier instantiation seeks
+instances that refute candidate models. Neither makes arbitrary quantified
+problems reliably decidable. See [Z3 Internals, quantifiers](https://z3prover.github.io/papers/z3internals.html).
 
-Primary web references were consulted on 2026-09-25. The format API pages displayed
-**1.0.0 (d05b3499b)**, matching the installed build. `stable` URLs can change; the
-local binding signatures and executed examples establish the version-specific
-contracts in this guide. Some upstream descriptive text still mentions historical
-enum spellings; use the installed names documented here.
+### Reading a verification frontend's query
 
-| Source | Use |
+A frontend such as F* translates source obligations into SMT assertions. The
+SMT-LIB `assert` command assumes a formula; it does not check a source-language
+assertion. To validate a source assertion, the frontend typically asserts the
+assumptions and negated obligation, then expects `unsat`. Its encoding may add
+uninterpreted symbols, axioms, triggers, and unfolding limits. Inspect the actual
+query before treating a timeout or a model as a source-level failure. F*'s fuel
+settings belong to its encoding and are not a generic Z3Py recursion option.
+See [Understanding how F* uses Z3](https://fstar-lang.org/tutorial/book/under_the_hood/uth_smt.html#understanding-how-f-uses-z3).
+
+<a id="s14"></a>
+
+## [S14] Strings, sequences, regular expressions, and floating point
+
+### Text versus bytes
+
+`String(name)` is SMT text, not a byte buffer or a C string. `StringVal(text)`
+constructs a literal. `Length`, `Concat`, `SubString(s, offset, length)`,
+`Contains`, `PrefixOf(prefix, s)`, `SuffixOf(suffix, s)`, and
+`IndexOf(s, needle, offset)` construct string constraints. `IndexOf` returns an
+integer expression, with minus one for no occurrence. `SubString`'s third
+argument is a length, not a Python slice endpoint.
+
+`Re(text)` constructs a literal regular expression, not a Python regex parser.
+Use `Range`, `Union`, `Concat`, `Star`, `Plus`, and `InRe` to build regex formulas.
+`SeqSort(element_sort)`, `Unit(element)`, and `Empty(sequence_sort)` generalize
+sequences beyond characters. Do not assume their layout models machine memory.
+
+**Runnable example:** constrain a short text value.
+
+```python
+import z3
+
+text = z3.String("text")
+s = z3.Solver()
+s.set(timeout=5000)
+s.add(z3.Length(text) == 4, z3.PrefixOf("AB", text), z3.SuffixOf("12", text))
+assert s.check() == z3.sat
+assert s.model().eval(text).as_string() == "AB12"
+```
+
+Use eight-bit bitvectors for arbitrary binary input, explicit byte encodings,
+embedded NULs, and bytewise arithmetic. Model UTF-8 encoding and C termination
+separately if they affect the target.
+
+### IEEE floating point
+
+`FP(name, Float32())` and `FP(name, Float64())` create IEEE-format values.
+`FPSort(exponent_bits, significand_bits)` includes the hidden significand bit.
+Use `fpAdd(rm, a, b)`, `fpSub`, `fpMul`, and `fpDiv` with explicit rounding:
+`RNE()` (nearest, ties to even), `RNA()`, `RTP()`, `RTN()`, or `RTZ()`.
+
+`fpEQ(a, b)` models IEEE equality: NaN is unequal to itself and signed zeros
+compare equal. Z3 term equality `a == b` instead expresses logical equality,
+which is reflexive and distinguishes the signed zeros. Use `fpIsNaN`, `fpIsInf`,
+`fpIsZero`, and `fpIsNegative` for classification.
+
+`fpBVToFP(bits, sort)` reinterprets an IEEE bit pattern; `fpToIEEEBV(value)`
+returns an encoding (NaN payloads are not preserved as distinct FP values).
+Numeric conversion is different: `fpToFP(rm, signed_bv, sort)` or
+`fpToFPUnsigned(rm, unsigned_bv, sort)`. Z3's FP theory does not automatically
+model CPU exception flags, flush-to-zero modes, or every NaN payload rule.
+
+**Runnable example:** compare signed zero and reinterpret the bits for 1.0.
+
+```python
+import z3
+
+positive = z3.FPVal(0.0, z3.Float32())
+negative = z3.fpMinusZero(z3.Float32())
+assert z3.is_true(z3.simplify(z3.fpEQ(positive, negative)))
+assert z3.is_false(z3.simplify(positive == negative))
+one = z3.fpBVToFP(z3.BitVecVal(0x3f800000, 32), z3.Float32())
+assert z3.is_true(z3.simplify(z3.fpEQ(one, z3.FPVal(1.0, z3.Float32()))))
+```
+
+<a id="s15"></a>
+
+## [S15] Optimization and soft constraints
+
+Use `Optimize()` when a feasible witness is not enough and an objective should
+be minimized or maximized. Its `add`, `check`, `model`, `push`, and `pop` resemble
+the solver interface, but objective handling and parameters are distinct.
+
+| Call | Contract |
 | --- | --- |
-| Installed `lief` module, method docstrings, config objects | Directly checked signatures, types, enum names, feature flag, and defaults. |
-| [Installation](https://lief.re/doc/stable/installation.html) | Distribution and platform installation guidance. |
-| [Binary abstraction Python API](https://lief.re/doc/stable/api/binary_abstraction/python.html) | Common model, byte access and patching context. |
-| [ELF Python API](https://lief.re/doc/stable/formats/elf/python.html) | ELF parser, structures and builder cross-checks. |
-| [PE Python API](https://lief.re/doc/stable/formats/pe/python.html) | PE parser, imports, address conversion and builders. |
-| [Mach-O Python API](https://lief.re/doc/stable/formats/macho/python.html) | FatBinary, slice selection and writing. |
-| [Official repository](https://github.com/lief-project/LIEF) | Upstream implementation and release provenance. |
+| `o.minimize(expr)` / `o.maximize(expr)` | Adds an arithmetic or supported bitvector objective; returns an objective handle. |
+| `o.add_soft(condition, weight="1", id=None)` | Adds a preference that may be violated; weight is a positive numeric weight, represented exactly as a string when appropriate. IDs group soft constraints. |
+| `o.check()` | Returns `sat`, `unsat`, or `unknown`; handle all three. |
+| `handle.lower()` / `handle.upper()` | Objective bounds as Z3 values; can involve infinity or infinitesimal terms. |
+| `o.set(priority="lex")` | Lexicographic objectives in insertion order (default). `pareto` and `box` have different semantics. |
+| `o.set(timeout=5000)` | Timeout in milliseconds; an interrupted optimization is not a certificate of optimality. |
 
-Explanations and lab fixtures in this document are original; no upstream tutorial
-or generated API appendix is reproduced. This is a practical working reference,
-not an exhaustive catalog of every LIEF format or native API.
+**Runnable example:** find the nearest integer satisfying a threshold.
+
+```python
+import z3
+
+x = z3.Int("x")
+o = z3.Optimize()
+o.set(timeout=5000)
+o.add(x >= 0, x <= 20, 3 * x >= 17)
+objective = o.minimize(x)
+assert o.check() == z3.sat
+assert o.model().eval(x).as_long() == 6
+assert objective.lower().as_long() == 6
+assert objective.upper().as_long() == 6
+```
+
+For strict real bounds, an optimum may be unattained: minimizing `x` with `x > 0`
+has infimum zero but no feasible minimizer. Inspect objective bounds rather than
+claiming a model attains a limit. Unbounded objectives can yield infinite bounds.
+For multiple objectives, `lex` prioritizes earlier objectives; `pareto` explores
+tradeoffs through successive checks; `box` finds independent objective bounds
+that need not be jointly attainable by one model.
+
+When minimizing a machine value, express the intended signedness explicitly
+with `BV2Int(value, is_signed=...)`. Soft constraints are preferences, never a
+replacement for mandatory safety or input-domain constraints.
+
+<a id="s16"></a>
+
+## [S16] AST inspection, simplification, tactics, and SMT-LIB
+
+For an expression `e`, `.sort()` reports its type, `.sexpr()` its SMT-LIB-like
+syntax, and `.children()` its immediate expression children. For applications,
+`.decl()` reports the declaration, `.decl().kind()` an operator identifier, and
+`.num_args()` / `.arg(i)` access arguments. Test `is_app`, `is_quantifier`, and
+`is_var` before applying node-specific methods; bound variables use indices.
+
+`simplify(e, **options)` returns an expression; it does not use a solver's
+assertions or establish arbitrary equivalence. `substitute(e, (old, new), ...)`
+performs structural expression substitution. Avoid replacing variable names by
+editing printed text. `help_simplify()` lists simplifier options.
+
+**Runnable example:** inspect, substitute, and round-trip a solver query.
+
+```python
+import z3
+
+x = z3.Int("x")
+expression = x + 2
+assert expression.num_args() == 2
+assert z3.simplify(z3.substitute(expression, (x, z3.IntVal(5)))).as_long() == 7
+s = z3.Solver()
+s.add(x >= 4, x <= 4)
+serialized = s.to_smt2()
+restored = z3.Solver()
+restored.from_string(serialized)
+assert restored.check() == z3.sat
+assert restored.model().eval(x).as_long() == 4
+```
+
+`parse_smt2_string(text, sorts={}, decls={})` returns an `AstVector` of assertions,
+not a solver result. `parse_smt2_file(path)` reads a file. `s.from_string(text)`
+and `s.from_file(path)` add parsed assertions. Pass declaration mappings when a
+fragment refers to already created symbols. Do not assume parsing executes an
+arbitrary interactive SMT-LIB command session. Save the last temporary
+assumptions, solver parameters, objectives, and version separately: an assertion
+export alone is not a full session replay. `e.sexpr()` alone may omit declarations.
+
+### Tactics transform goals; solvers answer queries
+
+`Goal()` holds formulas for transformation. `Tactic(name)(goal)` returns an
+`ApplyResult` containing subgoals, not `sat` or a `ModelRef`. In general, the
+original goal is satisfiable if at least one resulting subgoal is satisfiable.
+Model conversion can be necessary after eliminating variables; independently
+solving a transformed goal does not automatically recover the original model.
+
+Compose tactics with `Then`, alternatives with `OrElse`, bounded tactic execution
+with `TryFor(tactic, milliseconds)`, and tactic parameters with `With`.
+`Then(...).solver()` builds a solver that handles the tactic pipeline and model
+conversion. A tactic failure raises `Z3Exception`; it is not unsatisfiability.
+
+**Runnable example:** solve a small bitvector formula through a tactic pipeline.
+
+```python
+import z3
+
+x = z3.BitVec("x", 8)
+s = z3.Then("simplify", "bit-blast", "sat").solver()
+s.add(x + 1 == 0)
+assert s.check() == z3.sat
+assert s.model().eval(x).as_long() == 255
+```
+
+Discover available names with `tactics()` and parameters with `Tactic(name).help()`.
+Do not apply a bitvector-specific pipeline to arbitrary arrays, quantifiers,
+or arithmetic and assume the same coverage as the default solver.
+
+<a id="s17"></a>
+
+## [S17] Complete example: recover and replay a byte input
+
+This toy validator packs two uppercase bytes in little-endian order, XORs a
+constant, and compares the result. The third byte uses an eight-bit wrapped sum.
+All operations, widths, and the input domain are explicit. This example uses
+Z3 directly and has no dependency on angr or a target executable.
+
+**Runnable example:** recover the correlated input and prove its uniqueness
+within the stated input domain.
+
+```python
+import z3
+
+
+def concrete_accepts(data):
+    if len(data) != 3 or not all(0x41 <= byte <= 0x5a for byte in data):
+        return False
+    packed = int.from_bytes(data[:2], "little")
+    return (packed ^ 0x1234) == 0x5075 and ((data[0] + data[1]) & 0xff) == data[2] + 64
+
+
+b = [z3.BitVec(f"input_{i}", 8) for i in range(3)]
+s = z3.Solver()
+s.set(timeout=5000)
+for byte in b:
+    s.add(z3.UGE(byte, 0x41), z3.ULE(byte, 0x5a))
+packed = z3.Concat(b[1], b[0])
+s.add((packed ^ 0x1234) == 0x5075)
+# Widen the right-hand arithmetic to reflect the concrete Python predicate.
+# The left-hand sum wraps as an 8-bit operation before being widened.
+s.add(z3.ZeroExt(8, b[0] + b[1]) == z3.ZeroExt(8, b[2]) + 64)
+result = s.check()
+if result == z3.unknown:
+    raise RuntimeError(s.reason_unknown())
+assert result == z3.sat
+m = s.model()
+candidate = bytes(m.eval(byte, model_completion=True).as_long() for byte in b)
+assert candidate == b"ABC"
+assert concrete_accepts(candidate)
+s.add(z3.Or(*[byte != value for byte, value in zip(b, candidate)]))
+assert s.check() == z3.unsat  # no second candidate in this domain
+```
+
+For a real target, replace the concrete predicate with execution of the exact
+binary using its actual stdin/argv/file framing, and compare the observed success
+condition. Record any translation of machine operations into constraints.
+A recovered input establishes feasibility; only the second `unsat` query
+establishes uniqueness within this particular model and domain.
+
+### Moving between angr/Claripy and Z3Py
+
+Claripy ASTs and Z3Py ASTs are different objects with different APIs. Use
+Claripy through `state.solver` for normal angr tasks; do not insert Z3 ASTs into
+a SimState. In particular, do not translate `claripy_bv < constant` to
+`z3_bv < constant` without checking signedness. Z3's `model().eval(...)` is not
+Claripy's `state.solver.eval(...)`, which returns a concrete value directly.
+
+When exporting a formula, preserve widths, variable identities, and all path
+constraints. An isolated expression omits the conditions that made the angr
+state reachable. Backend conversion interfaces are version-sensitive and are
+outside this guide's tested examples. See [angr solver architecture](angr-doc.md#s13).
+
+<a id="s18"></a>
+
+## [S18] Bounded transition systems and reachability
+
+Z3 has no implicit execution loop. Introduce one symbolic state per step, assert
+an initial condition and transitions, and ask whether a bad state occurs in the
+chosen bound. This is bounded model checking. If only the final state is queried,
+the question is reachability at that exact step, unless the encoding provides
+stuttering or an explicit earlier-state disjunction.
+
+**Runnable example:** an eight-bit counter reaches three within three steps.
+
+```python
+import z3
+
+states = [z3.BitVec(f"counter_{i}", 8) for i in range(4)]
+s = z3.Solver()
+s.add(states[0] == 0)
+for current, following in zip(states, states[1:]):
+    s.add(following == current + 1)
+s.push()
+s.add(z3.Or(*[state == 3 for state in states[:3]]))
+assert s.check() == z3.unsat  # only steps 0, 1, 2 were queried
+s.pop()
+s.add(z3.Or(*[state == 3 for state in states]))
+assert s.check() == z3.sat
+assert [s.model().eval(state).as_long() for state in states] == [0, 1, 2, 3]
+```
+
+A bounded `unsat` result is not an unbounded safety proof. To establish an
+inductive invariant `I`, separately prove initialization implies `I`, each
+transition preserves `I`, and `I` implies the safety property. Each proof uses
+an unsatisfiable counterexample query. If the invariant is too weak, a failed
+induction query need not be an actual reachable program counterexample.
+
+<a id="s19"></a>
+
+## [S19] Solver internals and practical performance
+
+Z3 combines several engines. The standard SMT architecture combines Boolean
+search and learning with theory reasoning (often called CDCL(T)). Equality
+reasoning shares information among terms; theory solvers reason about arithmetic,
+arrays, and other domains. Many finite bitvector problems are reduced to Boolean
+constraints (bit-blasting). Preprocessing can remove or reshape formulas before
+search. These are explanatory models, not a promise of a specific engine for
+every query or release. See [Z3 Internals](https://z3prover.github.io/papers/z3internals.html).
+
+Practical consequences for an analysis agent:
+
+| Symptom / choice | Action and reason |
+| --- | --- |
+| An easy-looking query is slow | Inspect `.sexpr()` and sorts; accidental nonlinear terms or quantifiers can change the problem substantially. |
+| Machine arithmetic | Keep fixed widths where they match semantics; avoid unnecessary `BV2Int` / `Int2BV` crossings. |
+| Huge symbolic buffer or memory | Model only relevant regions and realistic input lengths; do not silently narrow the input domain merely to obtain a result. |
+| Repeated nearby queries | Reuse assertions with scopes or assumptions; measure against fresh solvers for the actual workload. |
+| Many equivalent expressions | Reuse constructed terms, simplify obvious redundancies, and profile encoding separately from solving. |
+| Symbolic products/division/variable shifts | Isolate their contribution and supply justified bounds; replacing them with constants changes the problem. |
+| Quantifier-heavy query | Inspect triggers and ground terms; use finite expansion only for an actually finite domain. |
+| Performance experiment | Save the exact formula and settings, change one choice, record time and result, and revalidate witnesses. |
+
+A random seed may help reproduce a particular run but does not make witnesses,
+cores, statistics, or performance stable across releases and platforms. Do not
+select parameters from an old article without checking the active object's
+`help()` or `param_descrs()`. A longer timeout does not correct a wrong encoding.
+
+<a id="s20"></a>
+
+## [S20] Contexts, concurrency, proof objects, and Horn clauses
+
+### Context isolation
+
+Use separate `Context` instances for independent threads. Do not concurrently
+operate on objects sharing a context; parallel solver internals are a different
+feature. `expr.translate(destination_context)` and
+`solver.translate(destination_context)` create translated objects. Construct
+literals in the same context as their operands or let safe coercions do so.
+For processes, serialize formulas and rebuild objects rather than sharing
+Python wrappers or raw native pointers.
+
+**Runnable example:** translate an existing solver to another context.
+
+```python
+import z3
+
+first, second = z3.Context(), z3.Context()
+x = z3.Int("x", ctx=first)
+s = z3.Solver(ctx=first)
+s.add(x == 7)
+copy = s.translate(second)
+assert copy.check() == z3.sat
+assert copy.model().eval(x.translate(second)).as_long() == 7
+```
+
+This checks translation, not concurrent thread execution. For production
+concurrency, isolate contexts for their full lifetime and test the exact API use.
+
+### Proof objects
+
+`Context(proof=True)` enables proof production for objects in that context;
+`s.proof()` retrieves a proof after `unsat` for supported configurations. Enable
+it before constructing the query. An unsat core is a subset of constraints; a
+proof object is a derivation. Proof formats and supported tactics vary, and
+retrieving an object is not the same as independently checking it. Proof
+certificate production/checking is not validated in this reference.
+
+### Fixedpoint and recursive reachability
+
+`Fixedpoint()` is a separate interface for relations and Horn rules. Principal
+calls are `register_relation(relation)`, `declare_var(*variables)`,
+`rule(head, body)`, `fact(atom)`, `query(atom)`, and `get_answer()`.
+`set(engine="spacer")` selects the property-directed Horn-clause engine.
+Interpret results relative to the reachability query: `sat` means the queried
+relation is reachable/derivable, `unsat` means it is not, and `unknown` is
+inconclusive. `get_answer()` is engine-dependent, not an ordinary solver model.
+
+**Runnable example:** derive a reachable counter value with Horn rules.
+
+```python
+import z3
+
+reach = z3.Function("reach", z3.IntSort(), z3.BoolSort())
+x = z3.Int("x")
+fp = z3.Fixedpoint()
+fp.set(engine="spacer", timeout=5000)
+fp.register_relation(reach)
+fp.declare_var(x)
+fp.fact(reach(0))
+fp.rule(reach(x + 1), z3.And(reach(x), x < 3))
+assert fp.query(reach(3)) == z3.sat
+assert fp.query(reach(4)) == z3.unsat
+```
+
+User propagators, solver callbacks, custom theories, and full invariant-synthesis
+workflows are specialist interfaces outside this guide's validated coverage.
+Consult the matching public API and build a small reproducer before integrating.
+
+<a id="s21"></a>
+
+## [S21] Troubleshooting and safe result interpretation
+
+| Symptom / searchable error | Likely cause | Check or fix |
+| --- | --- | --- |
+| `ModuleNotFoundError: z3` | Wrong interpreter or missing distribution | Install `z3-solver` with that interpreter; inspect its environment. |
+| `module 'z3' has no attribute 'Solver'` | Shadowing, unrelated package, or incomplete installation | Print `z3.__file__`; test a fresh pinned environment. Metadata alone does not validate imports. |
+| `Z3Exception: sort mismatch` / incompatible bitvector sizes | Mixed widths, kinds, or malformed arguments | Print operand sorts; use deliberate extension/extraction/conversion. |
+| `context mismatch` | Objects from different contexts | Construct consistently or explicitly `translate`. |
+| `Symbolic expressions cannot be cast to concrete Boolean values` | Python condition, `and`, `or`, `not`, or chained comparison | Build Z3 Boolean expressions and issue an explicit query. |
+| Wrong branch selected without an exception | Equality converted structurally to a Python Boolean | Audit all Python control flow using symbolic values. |
+| `model is not available` | No successful current `sat` query | Handle `check()` first; recheck after mutations. |
+| `.as_long()` missing or failing | Value is symbolic, nonintegral, or another sort | Evaluate first and inspect its kind; use the correct conversion. |
+| Unexpected negative / huge integer | Signedness or bitvector interpretation | Compare `as_long()` with `as_signed_long()` and inspect operators. |
+| Constraint on a byte is always false | E.g. `byte < 256` coerced 256 to zero | Use a valid bound such as `ULE(byte, 255)` or widen first. |
+| Division/shift disagrees with the binary | SMT operation differs from instruction semantics | Model count masking, signed division, traps, promotions, and overflow. |
+| Arbitrary zeros or absent model entries | Underconstrained or irrelevant inputs | Decide whether missing constraints are intended; completion is arbitrary. |
+| Repeated or missing enumeration results | Blocking a wrong expression/tuple | Extract and block the entire selected tuple from one model. |
+| `unknown`, timeout, resource exhaustion | Incomplete theory reasoning or budget | Record diagnostic and limits; never relabel as `unsat`. |
+| `unsat` unexpectedly | Contradictory assumptions, width error, stale scope | Check smaller subsets or tracking cores; inspect asserted formulas. |
+| Every property appears provable | Base assumptions already inconsistent | Check base satisfiability before negating the property. |
+| A satisfiable witness fails replay | Incomplete/wrong encoding or input framing | Compare concrete and symbolic computations at their first divergence. |
+| A tactic returns subgoals | Confusing transformation with solving | Use a solver built from the tactic or handle subgoal/model conversion properly. |
+| Optimization gives a surprising model | Priority, unboundedness, strict bound, or timeout | Inspect objective bounds, result, and exact objective sorts. |
+
+A useful bug report includes Python/distribution/library versions, platform,
+minimal standalone code or SMT-LIB, settings, expected versus observed semantics,
+last result and diagnostic, and whether the failure reproduces in a clean
+environment. Do not remove constraints until a candidate appears and report it
+as solving the original problem.
+
+<a id="s22"></a>
+
+## [S22] Validation, reproduction, and coverage limits
+
+Reference date: **2026-09-25**. The guide targets the repository's
+**z3-solver 5.1.0.0** pin. An initial check, completed before further runtime
+validation was deferred, executed all **23 runnable examples** successfully
+with **CPython 3.12.14**, native library **Z3 5.1.0**, on Linux x86-64 in an
+isolated environment. This is a check of these examples, not a compatibility
+claim for every API or target. No repository dependency was changed.
+
+To reproduce an individual example, install the pinned package as described in
+[S01](#s01), copy its complete Python fence into a file, and run it with that
+interpreter and assertions enabled (without `-O`). Every Python fence is
+independent and includes its own imports and inputs. Silent completion means
+its assertions passed. The examples cover solving, signed arithmetic, model
+completion, cores, enumeration, arrays, datatypes, quantifiers, strings,
+floating point, optimization, SMT-LIB, tactics, byte recovery/replay, bounded
+reachability, context translation, and Horn rules.
+
+Not validated: native binary replay, multi-threaded execution, proof certificate
+checking, all optimizer priorities, every theory combination, or every API
+member. The guide is a working reference, not an exhaustive generated API dump.
+A passing small quantified example does not establish completeness for general
+quantified inputs. Timings, chosen witnesses, core membership beyond logical
+necessity, and internal statistics can vary across versions.
+
+<a id="s23"></a>
+
+## [S23] Source trail and glossary
+
+The examples and explanations are original. Public API contracts were checked
+against the installed 5.1.0.0 Python binding (`z3/z3.py`) and executable examples.
+The web references below were consulted on 2026-09-25; they are supplemental,
+and their historical versions or rolling API content can differ from this pin.
+
+| Source | What to consult it for |
+| --- | --- |
+| [Programming Z3](https://z3prover.github.io/papers/programmingz3.html) | Broad survey of theories, solver interaction, tactics, and optimization; its architecture discussion is historically versioned. |
+| [Z3 Internals (draft)](https://z3prover.github.io/papers/z3internals.html) | Engines, equality reasoning, model construction, quantifiers, and preprocessing. |
+| [Understanding how F* uses Z3](https://fstar-lang.org/tutorial/book/under_the_hood/uth_smt.html#understanding-how-f-uses-z3) | Verification conditions, SMT assertion meaning, frontend encodings and query inspection. |
+| [Z3Py public API reference](https://z3prover.github.io/api/html/namespacez3py.html) | Searchable constructor/function/class reference; confirm details against the installed binding. |
+| [Z3 source repository](https://github.com/Z3Prover/z3) | Installation, release history, source, and issue reporting. |
+
+For local API details, use Python `help(z3.Solver)` or `help(z3.BV2Int)` and inspect
+`z3.__file__` to locate the installed binding. For parameter availability, use
+the specific solver/tactic object's help instead of relying on generic lists.
+
+| Term | Meaning |
+| --- | --- |
+| AST | Abstract syntax tree; Z3 shares immutable subterms, so the implementation is a graph. |
+| Sort | Logical type of an expression. |
+| SMT | Satisfiability modulo theories: Boolean reasoning combined with domain semantics. |
+| Theory | Meaning and rules for operations such as arithmetic, arrays, or bitvectors. |
+| Assertion | Constraint assumed true in the current query. |
+| Model / witness | Interpretation satisfying a query; not necessarily unique. |
+| Validity | Truth for every assignment satisfying the assumptions. |
+| Counterexample | A model satisfying the assumptions and negated property. |
+| Projection | The selected expressions whose values matter when extracting/enumerating models. |
+| Unsat core | An inconsistent subset of tracked assumptions relative to the background. |
+| Trigger / pattern | Term shape guiding quantifier instantiation. |
+| Bit-blasting | Reduction of bitvector operations to Boolean constraints. |
+| VC | Verification condition encoding a proof obligation. |
+| BMC | Bounded model checking over a finite number of transitions. |
+| Horn clause | Rule relating predicates, used by fixedpoint engines for reachability/invariants. |
