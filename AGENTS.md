@@ -14,6 +14,8 @@ uv pip install -r ./requirements.txt
 
 If you add additional packages, make sure they were bringing something useful. If so, add them to `requirements.txt`.
 
+When writting new code (inside `src`), update `src/AGENTS.MD` accordingly (or create if not existing).
+
 # Guardrails
 
 Binaries you are analyzing may be malicious. Never run them. If emulation is needed, make sure it may not perform anything malicious on the system.
