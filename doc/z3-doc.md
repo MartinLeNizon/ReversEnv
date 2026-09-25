@@ -12,7 +12,7 @@ such as angr. See also [the angr reference](angr-doc.md#s06).
 
 This reference targets ReversEnv's **`z3-solver==5.1.0.0`** dependency. Examples
 were tested with **CPython 3.12.14, Z3 5.1.0, Linux x86-64** in a clean environment.
-See [validation and reproduction](#s22) for the exact scope and environment caveat.
+See [validation and reproduction](#s22) for the exact scope and reproduction steps.
 Use the task table to retrieve a small section; do not load the whole reference
 when a single API contract or recipe answers the question.
 
