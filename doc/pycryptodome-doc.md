@@ -589,7 +589,7 @@ and Ed25519 signing is not X25519 agreement.
 | Scheme | Constructor / input / encoding |
 | --- | --- |
 | ECDSA | `DSS.new(key, mode, encoding='binary', randfunc=None)`. `mode='fips-186-3'` uses randomness; `'deterministic-rfc6979'` derives the signing nonce. Pass a hash object to `sign` / `verify`. |
-| ECDSA output | Default `'binary'` is fixed-width `r || s`; `'der'` is an ASN.1 sequence. A valid DER signature can have variable length. Peers must use the same encoding. |
+| ECDSA output | Default `'binary'` is fixed-width `r \|\| s`; `'der'` is an ASN.1 sequence. A valid DER signature can have variable length. Peers must use the same encoding. |
 | EdDSA | `eddsa.new(key, mode='rfc8032', context=None)`. Ed25519/Ed448 only. Pure mode takes message bytes; prehash variants require the appropriate hash object, not arbitrary digest bytes. |
 | Verification | Invalid signatures raise `ValueError`. In 3.23.0, DSS returns **`False` on success** (a legacy-compatibility safeguard), while EdDSA returns `None`. Do not use a boolean test. Invalid key/scheme combinations can fail at construction. |
 
@@ -796,7 +796,7 @@ before using a specialist feature.
 | `verify(...)` appears false | DSS returns `False` on success; PSS/EdDSA/MAC verification returns `None` | Treat no exception as success, not return truthiness. |
 | RSA plaintext too long | OAEP size bound exceeded | Wrap a session key and encrypt bulk data with AEAD. |
 | OAEP/PSS interoperability failure | Hash, MGF, label, or salt length mismatch | Set suite parameters explicitly at both ends. |
-| ECDSA signature rejected | Binary `r||s` versus DER, wrong curve/hash | Match all three; do not assume defaults define the peer wire format. |
+| ECDSA signature rejected | Binary `r\|\|s` versus DER, wrong curve/hash | Match all three; do not assume defaults define the peer wire format. |
 | Ed25519 signature mismatch | Pure versus prehash/context mismatch | Match scheme and message representation, not only curve name. |
 | PEM write raises type error | RSA PEM is bytes; ECC PEM is text | Match file mode or encode text explicitly. |
 | Password KDF consumes too much memory/time | Excessive or attacker-selected costs | Bound inputs before KDF; benchmark allowed costs. |
