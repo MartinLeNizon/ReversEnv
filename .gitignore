@@ -4,4 +4,7 @@ bin/*
 writeups/*
 !writeups/.gitkeep
 
+src/*
+!src/.gitkeep
+
 __pycache__
