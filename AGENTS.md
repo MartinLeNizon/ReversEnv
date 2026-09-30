@@ -3,6 +3,7 @@
 * `bin` is the directory for binaries. If you extract any executable or shellcode, put them there.
 * `src` is where any code you write should go.
 * `doc` is where documentation for specific tool (and python packages) is.
+* `writeups` is where you should write reports about what you did and how you did it.
 
 # Instructions
 
@@ -17,6 +18,8 @@ uv pip install -r ./requirements.txt
 If you add additional packages, make sure they are bringing something useful before adding them to `requirements.txt`.
 
 When writting new code (inside `src`), update `src/AGENTS.MD` accordingly (or create if not existing).
+
+When analyzing a binary or solving a challenge, always explain what you did, how, and why, in the folder `writeups`.
 
 # Guardrails
 
