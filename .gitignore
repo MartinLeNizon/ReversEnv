@@ -1,0 +1,7 @@
+bin/*
+!bin/.gitkeep
+
+writeups/*
+!writeups/.gitkeep
+
+__pycache__
